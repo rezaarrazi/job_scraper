@@ -1,0 +1,10 @@
+flask
+python-dotenv
+sqlalchemy
+psycopg2-binary
+pydantic
+numpy
+tqdm
+google-genai
+python-jose
+firecrawl
