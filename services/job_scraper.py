@@ -51,9 +51,13 @@ class JobScraper:
             return job_site
 
     async def update_job_site_patterns(self, job_site, patterns):
-        db = await self.get_db()
-        job_site.regex_patterns = patterns
-        await db.commit()
+        logger.info(f"Updating job site patterns: {patterns}")
+
+        async with AsyncSessionLocal() as db:
+            job_site.regex_patterns = patterns
+            db.add(job_site)
+            await db.commit()
+            await db.refresh(job_site)
 
     async def create_or_update_job(self, job_site, job_url, job_data, regex_patterns):
         async with AsyncSessionLocal() as db:
@@ -87,20 +91,25 @@ class JobScraper:
             await db.commit()
             return job
 
-    async def get_page(self, url: str, format: str = 'markdown') -> Optional[str]:
+    async def get_page(self, url: str) -> Optional[str]:
         """Asynchronously fetch page content."""
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         }
         
-        # Run synchronous requests.get in thread pool
-        request_func = partial(requests.get, url=url, headers=headers)
+        # Use firecrawl to extract HTML
         try:
-            response = await self.loop.run_in_executor(self.executor, request_func)
-            if response.status_code != 200:
-                logger.error(f"Failed to fetch {url}, status code: {response.status_code}")
+            response = await self.loop.run_in_executor(
+                self.executor,
+                lambda: self.firecrawl_app.scrape_url(
+                    url=url,
+                    params={'formats': ['html']}
+                )
+            )
+            if not response or 'html' not in response:
+                logger.error(f"Failed to fetch {url} using firecrawl")
                 return None
-            return response.text
+            return response['html']
         except Exception as e:
             logger.error(f"Error fetching {url}: {str(e)}")
             return None
@@ -135,7 +144,7 @@ class JobScraper:
 
     async def fetch_job_details(self, url: str, job_url: str):
         logger.info(f"Fetching job details from {job_url}")
-        html = await self.get_page(job_url, format='html')
+        html = await self.get_page(job_url)
         if not html:
             logger.error(f"Failed to fetch {job_url}")
             return
@@ -150,7 +159,7 @@ class JobScraper:
             existing_job = result.scalar_one_or_none()
 
         if existing_job and existing_job.regex_patterns:
-            regex = existing_job.regex_patterns
+            regex_pattern = existing_job.regex_patterns
         else:
             job_data = await self.extract_job_data(job_url)
 
@@ -175,14 +184,16 @@ class JobScraper:
             await self.create_or_update_job(job_site, job_url, extracted_data, regex_pattern)
 
     async def fetch_jobs(self, url: str, 
-                        batch_size: int = settings.BATCH_SIZE, 
-                        max_concurrent: int = settings.MAX_CONCURRENT):
+                        batch_size: int, 
+                        max_concurrent: int):
         """Asynchronously fetch job postings from a career page."""
-        markdown = await self.get_page(url, format='html')
-        if not markdown:
+        html = await self.get_page(url)
+        
+        if not html:
+            logger.error(f"Failed to fetch {url}")
             return
         
-        self.pages[url] = markdown
+        self.pages[url] = html
         job_site = await self.get_or_create_job_site(url)
 
         # If regex is not stored, analyze the structure with AI
@@ -193,15 +204,17 @@ class JobScraper:
         stored_patterns = result.scalar_one_or_none()
         
         if not stored_patterns:
-            prompt = JOB_CARD_PROMPT.format(markdown=markdown)
+            prompt = JOB_CARD_PROMPT.format(markdown=html)
             job_card_pattern = await self.analyze_structure_with_ai(prompt, JobCardPatternSchema)
-            self.regex_patterns[url] = {'job_site': job_card_pattern, 'job_listing': {}}
-            await self.update_job_site_patterns(job_site, self.regex_patterns[url])
+            self.regex_patterns[url] = job_card_pattern
+            
+            await self.update_job_site_patterns(job_site, self.regex_patterns[url].get('job_url_pattern', {}))
         else:
             self.regex_patterns[url] = stored_patterns
 
-        regex_pattern = self.regex_patterns[url]['job_site']['job_url_pattern']['pattern']
-        job_urls = re.findall(regex_pattern, markdown)
+        regex_pattern = self.regex_patterns[url]['job_url_pattern']['pattern']
+        logger.info(f"Regex pattern: {regex_pattern}")
+        job_urls = re.findall(regex_pattern, html)
         job_urls = np.unique(job_urls).tolist()
 
         # Create a semaphore to limit concurrent requests
@@ -212,12 +225,14 @@ class JobScraper:
                 full_url = job_url if job_url.startswith("http") else url + job_url
                 await self.fetch_job_details(url, full_url)
 
-        # Process jobs in batches
+        # Modify batch size to respect rate limit (10 requests per minute)
+        rate_limit_batch_size = min(batch_size, 10)  # Never process more than 10 at once
+        
         total_processed = 0
         logger.info(f"Found {len(job_urls)} jobs to process")
 
-        for i in range(0, len(job_urls), batch_size):
-            batch = job_urls[i:i + batch_size]
+        for i in range(0, len(job_urls), rate_limit_batch_size):
+            batch = job_urls[i:i + rate_limit_batch_size]
             tasks = [process_job_with_semaphore(job_url) for job_url in batch]
             
             try:
@@ -225,11 +240,12 @@ class JobScraper:
                 total_processed += len(batch)
                 logger.info(f"Processed {total_processed}/{len(job_urls)} jobs")
             except Exception as e:
-                logger.error(f"Error processing batch {i//batch_size + 1}: {str(e)}")
+                logger.error(f"Error processing batch {i//rate_limit_batch_size + 1}: {str(e)}")
                 continue
 
-            # Optional: Add a small delay between batches to be more considerate to the server
-            await asyncio.sleep(1)
+            # Wait for 60 seconds after each batch to respect the rate limit
+            logger.info("Waiting 60 seconds to respect rate limit...")
+            await asyncio.sleep(60)
 
     async def __aenter__(self):
         return self

@@ -38,13 +38,13 @@ class JobSite(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
-    jobs = relationship("Job", back_populates="job_site", cascade="all, delete-orphan")
+    jobs = relationship("Job", back_populates="job_site", cascade="all, delete-orphan", passive_deletes=True)
 
 class Job(Base):
     __tablename__ = "jobs"
     
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    job_site_id = Column(UUID(as_uuid=True), ForeignKey("job_sites.id"))
+    job_site_id = Column(UUID(as_uuid=True), ForeignKey("job_sites.id", ondelete="CASCADE"), nullable=False)
     job_url = Column(String, unique=True, index=True)
     company_name = Column(String)
     company_industry = Column(String, nullable=True)

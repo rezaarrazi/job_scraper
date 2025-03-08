@@ -17,8 +17,8 @@ router = APIRouter(
 @router.post("/scrape")
 async def scrape_job(
     url: Dict[str, str],
-    batch_size: int = Query(default=50, gt=0, le=100),
-    max_concurrent: int = Query(default=10, gt=0, le=20)
+    batch_size: int = Query(default=10, gt=0, le=100),
+    max_concurrent: int = Query(default=5, gt=0, le=20)
 ):
     try:
         if not url.get("url"):
