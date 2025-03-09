@@ -54,3 +54,14 @@ class PaginationPattern(BaseModel):
 class JobSiteAnalysis(BaseModel):
     job_url_pattern: RegexPatternSchema
     pagination: PaginationPattern 
+
+class ScrapeResponse(BaseModel):
+    task_id: str
+
+class ScrapeStatusResponse(BaseModel):
+    task_id: str
+    status: str
+    progress: int
+    error: Optional[str] = None
+    started_at: datetime
+    completed_at: Optional[datetime] = None 

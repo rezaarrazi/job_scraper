@@ -1,4 +1,4 @@
-from sqlalchemy import create_engine, Column, String, JSON, DateTime, Integer, ForeignKey
+from sqlalchemy import create_engine, Column, String, JSON, DateTime, Integer, ForeignKey, Text, Enum
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from datetime import datetime
@@ -62,6 +62,17 @@ class Job(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
     job_site = relationship("JobSite", back_populates="jobs")
+
+class ScrapingTask(Base):
+    __tablename__ = "scraping_tasks"
+
+    id = Column(String, primary_key=True)  # UUID
+    url = Column(String, nullable=False)
+    status = Column(Enum('pending', 'running', 'completed', 'failed', name='task_status'), default='pending')
+    progress = Column(Integer, default=0)
+    error = Column(Text, nullable=True)
+    started_at = Column(DateTime, default=datetime.utcnow)
+    completed_at = Column(DateTime, nullable=True)
 
 async def init_db():
     async with engine.begin() as conn:

@@ -2,7 +2,6 @@ import os
 import re
 import json
 import requests
-import logging
 from typing import Dict, Optional
 import numpy as np
 from tqdm import tqdm
@@ -14,13 +13,16 @@ from functools import partial
 from concurrent.futures import ThreadPoolExecutor
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from datetime import datetime
+import uuid
 
-from database import AsyncSessionLocal, Job, JobSite
+from database import AsyncSessionLocal, Job, JobSite, ScrapingTask
 from schemas import JobDetailPatternSchema, JobSchema, JobSiteAnalysis, PaginationType, PaginationPattern
 from prompt import JOB_EXTRACTION_PROMPT, REGEX_EXTRACTION_PROMPT, SITE_ANALYSIS_PROMPT
 from config import settings
+from utils.logger import setup_logger
 
-logger = logging.getLogger(__name__)
+logger = setup_logger(__name__)
 
 class JobScraper:
     def __init__(self):
@@ -195,10 +197,7 @@ class JobScraper:
         logger.info(f"Analyzed site structure - Pagination type: {site_analysis['pagination']['type']}")
         return site_analysis
 
-    async def fetch_jobs(self, url: str, 
-                        batch_size: int, 
-                        max_concurrent: int,
-                        max_pages: int = 10):
+    async def fetch_jobs(self, task_id: str, url: str, batch_size: int = 10, max_concurrent: int = 5, max_pages: int = 10):
         """Asynchronously fetch job postings from a career page."""
         all_job_urls = set()
         
@@ -281,9 +280,20 @@ class JobScraper:
                 await asyncio.sleep(2)
 
         # Process found jobs (rest of the code remains the same)
-        job_urls = list(all_job_urls)
+        job_urls = list(np.unique(list(all_job_urls)))
         semaphore = asyncio.Semaphore(max_concurrent)
+        total_jobs = len(job_urls)
         
+        async def update_progress(processed_count: int):
+            async with AsyncSessionLocal() as db:
+                task = await db.get(ScrapingTask, task_id)
+                if task:
+                    task.progress = min(round((processed_count / total_jobs) * 100), 99)
+                    await db.commit()
+                    logger.debug(f"Updated progress for task {task_id}: {task.progress}%")
+                else:
+                    logger.error(f"Task {task_id} not found")
+
         async def process_job_with_semaphore(job_url: str):
             async with semaphore:
                 full_url = job_url if job_url.startswith("http") else url + job_url
@@ -297,16 +307,71 @@ class JobScraper:
             batch = job_urls[i:i + rate_limit_batch_size]
             tasks = [process_job_with_semaphore(job_url) for job_url in batch]
             
-            try:
-                await asyncio.gather(*tasks)
-                total_processed += len(batch)
-                logger.info(f"Processed {total_processed}/{len(job_urls)} jobs")
-            except Exception as e:
-                logger.error(f"Error processing batch {i//rate_limit_batch_size + 1}: {str(e)}")
-                continue
-
+            await asyncio.gather(*tasks)
+            total_processed += len(batch)
+            
+            # Update progress in database
+            await update_progress(total_processed)
+            
             logger.info("Waiting 60 seconds to respect rate limit...")
             await asyncio.sleep(60)
+
+    async def start_scraping(self, url: str, batch_size: int = 10, max_concurrent: int = 5, max_pages: int = 10) -> str:
+        task_id = str(uuid.uuid4())
+        
+        async with AsyncSessionLocal() as db:
+            task = ScrapingTask(
+                id=task_id,
+                url=url,
+                status='pending',
+                started_at=datetime.utcnow()
+            )
+            db.add(task)
+            await db.commit()
+
+        # Start the scraping process in the background
+        asyncio.create_task(self._run_scraping(task_id, url, batch_size, max_concurrent, max_pages))
+        
+        return task_id
+
+    def _cleanup_url_data(self, url: str):
+        """Clean up stored data for a specific URL"""
+        if url in self.pages:
+            del self.pages[url]
+        if url in self.regex_patterns:
+            del self.regex_patterns[url]
+        if url in self.jobs:
+            del self.jobs[url]
+
+    async def _run_scraping(self, task_id: str, url: str, batch_size: int, max_concurrent: int, max_pages: int = 10):
+        async with AsyncSessionLocal() as db:
+            try:
+                # Update status to running
+                task = await db.get(ScrapingTask, task_id)
+                task.status = 'running'
+                await db.commit()
+
+                await self.fetch_jobs(task_id, url, batch_size, max_concurrent, max_pages)
+                
+                # Update status to completed
+                task.status = 'completed'
+                task.progress = 100
+                task.completed_at = datetime.utcnow()
+                
+            except Exception as e:
+                # Update status to failed
+                task.status = 'failed'
+                task.error = str(e)
+                task.completed_at = datetime.utcnow()
+            
+            finally:
+                await db.commit()
+                self._cleanup_url_data(url)
+
+    async def get_task_status(self, task_id: str):
+        async with AsyncSessionLocal() as db:
+            task = await db.get(ScrapingTask, task_id)
+            return task
 
     async def __aenter__(self):
         return self
