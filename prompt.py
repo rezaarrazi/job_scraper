@@ -1,37 +1,3 @@
-JOB_CARD_PROMPT = """**Analyze the following HTML and extract a regex pattern that accurately captures job URLs, ensuring no duplicates.** The extracted URLs should be:  
-
-1. **Precise** – The regex should target only valid job URLs.  
-2. **Unique** – Prevent duplicate URLs by ensuring a strict match that excludes repeated or tracking variations.  
-3. **Context-Aware** – The pattern should be anchored to specific job card structures in the HTML.  
-4. **Minimal False Positives** – Ensure that only valid job listing URLs are captured, avoiding irrelevant links.
-
----
-
-### **Input Format:**  
-```html
-{markdown}
-```
-
----
-
-### **Output Requirements:**  
-1. **Regex pattern for extracting job URLs.**  
-2. **Explanation of the regex pattern,** detailing:  
-   - **Why it works** for the given HTML structure.  
-   - **How it ensures uniqueness**, avoiding duplicate URLs.  
-   - **How it filters out tracking parameters or extra attributes.**  
-3. **Improvements if needed,** such as:  
-   - Restricting matches to specific `<a>` tags inside job cards.  
-   - Using `data-*` attributes if available for better reliability.  
-   - Avoiding duplicate extraction of the same base URL.
-
-### **Additional Considerations:**  
-✅ **Ensure extracted URLs are absolute links** (convert relative URLs if necessary).  
-✅ **Use regex anchors (`^`, `$`) or word boundaries** to make matches stricter.  
-✅ **Filter tracking parameters** (e.g., `?utm_source`, `?ref=`) if present.  
-
-"""
-
 JOB_EXTRACTION_PROMPT = '''**Extract the following details from the given job posting page.** Ensure the extracted information is structured, formatted clearly, and follows the descriptions provided below. **Do not add, remove, or summarize any words—extract the text exactly as it appears.** This is crucial for maintaining the original structure, as the extracted data will be used for regex pattern analysis.
 
 1. **Company Name**: The name of the company offering the job position.  
@@ -81,3 +47,21 @@ Extracted Job Data:
 HTML Page Source:
 {html}
 '''
+
+SITE_ANALYSIS_PROMPT = """Analyze the HTML structure for both job listings and pagination patterns.
+
+1. Find the regex pattern for job listing URLs or links:
+   - Identify common URL structures
+   - Create a regex pattern that matches job listing URLs
+   - Ensure the pattern captures complete, valid URLs
+
+2. Determine the pagination implementation:
+   - Check for numbered pagination, load more buttons, or infinite scroll
+   - Identify URL patterns or API endpoints for loading more jobs
+   - Look for CSS selectors of pagination elements
+   - Find parameters used for pagination (page numbers, offsets)
+
+HTML Content:
+{markdown}
+
+Return a structured analysis including both job URL regex patterns and pagination details."""

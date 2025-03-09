@@ -37,6 +37,8 @@ class JobSite(Base):
     regex_patterns = Column(JSON)  # Store job_site regex patterns
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    pagination_type = Column(String)
+    pagination_info = Column(JSON)
     
     jobs = relationship("Job", back_populates="job_site", cascade="all, delete-orphan", passive_deletes=True)
 

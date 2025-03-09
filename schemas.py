@@ -1,13 +1,11 @@
 from typing import List, Optional
 from pydantic import BaseModel
 from datetime import datetime
+from enum import Enum
 
 class RegexPatternSchema(BaseModel):
     pattern: str
     explanation: str
-
-class JobCardPatternSchema(BaseModel):
-    job_url_pattern: RegexPatternSchema
 
 class JobSchema(BaseModel):
     company_name: str
@@ -38,4 +36,21 @@ class JobResponse(BaseModel):
     job_title: str
     location: Optional[str]
     created_at: datetime
-    updated_at: datetime 
+    updated_at: datetime
+
+class PaginationType(str, Enum):
+    NONE = "none"
+    PAGE_NUMBERS = "page_numbers"
+    LOAD_MORE = "load_more"
+    INFINITE_SCROLL = "infinite_scroll"
+
+class PaginationPattern(BaseModel):
+    type: PaginationType
+    next_page_pattern: RegexPatternSchema
+    load_more_selector: str
+    page_param: str
+    items_per_page: int
+
+class JobSiteAnalysis(BaseModel):
+    job_url_pattern: RegexPatternSchema
+    pagination: PaginationPattern 

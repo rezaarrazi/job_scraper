@@ -16,8 +16,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import AsyncSessionLocal, Job, JobSite
-from schemas import JobCardPatternSchema, JobDetailPatternSchema, JobSchema
-from prompt import JOB_CARD_PROMPT, JOB_EXTRACTION_PROMPT, REGEX_EXTRACTION_PROMPT
+from schemas import JobDetailPatternSchema, JobSchema, JobSiteAnalysis, PaginationType, PaginationPattern
+from prompt import JOB_EXTRACTION_PROMPT, REGEX_EXTRACTION_PROMPT, SITE_ANALYSIS_PROMPT
 from config import settings
 
 logger = logging.getLogger(__name__)
@@ -50,11 +50,13 @@ class JobScraper:
                 await db.commit()
             return job_site
 
-    async def update_job_site_patterns(self, job_site, patterns):
-        logger.info(f"Updating job site patterns: {patterns}")
+    async def update_job_site_patterns(self, job_site, site_analysis):
+        logger.info(f"Updating job site patterns and pagination info: {site_analysis}")
 
         async with AsyncSessionLocal() as db:
-            job_site.regex_patterns = patterns
+            job_site.regex_patterns = site_analysis['job_url_pattern']
+            job_site.pagination_type = site_analysis['pagination']['type']
+            job_site.pagination_info = site_analysis['pagination']
             db.add(job_site)
             await db.commit()
             await db.refresh(job_site)
@@ -183,20 +185,33 @@ class JobScraper:
             # Save to database
             await self.create_or_update_job(job_site, job_url, extracted_data, regex_pattern)
 
+    async def analyze_site_structure(self, url: str, html: str) -> JobSiteAnalysis:
+        """Analyze both job cards and pagination in a single LLM call."""
+        prompt = SITE_ANALYSIS_PROMPT.format(markdown=html)
+        site_analysis = await self.analyze_structure_with_ai(
+            prompt, 
+            JobSiteAnalysis
+        )
+        logger.info(f"Analyzed site structure - Pagination type: {site_analysis['pagination']['type']}")
+        return site_analysis
+
     async def fetch_jobs(self, url: str, 
                         batch_size: int, 
-                        max_concurrent: int):
+                        max_concurrent: int,
+                        max_pages: int = 10):
         """Asynchronously fetch job postings from a career page."""
-        html = await self.get_page(url)
+        all_job_urls = set()
         
-        if not html:
-            logger.error(f"Failed to fetch {url}")
+        # Get initial page and analyze structure
+        initial_html = await self.get_page(url)
+        if not initial_html:
+            logger.error(f"Failed to fetch initial page from {url}")
             return
-        
-        self.pages[url] = html
+            
+        self.pages[url] = initial_html
         job_site = await self.get_or_create_job_site(url)
 
-        # If regex is not stored, analyze the structure with AI
+        # Get or analyze site structure
         db = await self.get_db()
         result = await db.execute(
             select(JobSite.regex_patterns).filter(JobSite.id == job_site.id)
@@ -204,32 +219,79 @@ class JobScraper:
         stored_patterns = result.scalar_one_or_none()
         
         if not stored_patterns:
-            prompt = JOB_CARD_PROMPT.format(markdown=html)
-            job_card_pattern = await self.analyze_structure_with_ai(prompt, JobCardPatternSchema)
-            self.regex_patterns[url] = job_card_pattern
-            
-            await self.update_job_site_patterns(job_site, self.regex_patterns[url].get('job_url_pattern', {}))
+            site_analysis = await self.analyze_site_structure(url, initial_html)
+            self.regex_patterns[url] = site_analysis['job_url_pattern']
+            await self.update_job_site_patterns(job_site, site_analysis)
+            pagination_info = PaginationPattern(**site_analysis['pagination'])
         else:
             self.regex_patterns[url] = stored_patterns
+            # Use stored pagination info if available, otherwise re-analyze
+            if hasattr(job_site, 'pagination_info') and job_site.pagination_info:
+                pagination_info = PaginationPattern(**job_site.pagination_info)
+            else:
+                site_analysis = await self.analyze_site_structure(url, initial_html)
+                pagination_info = site_analysis['pagination']
+                await self.update_job_site_patterns(job_site, site_analysis)
 
-        regex_pattern = self.regex_patterns[url]['job_url_pattern']['pattern']
-        logger.info(f"Regex pattern: {regex_pattern}")
-        job_urls = re.findall(regex_pattern, html)
-        job_urls = np.unique(job_urls).tolist()
+        regex_pattern = self.regex_patterns[url]['pattern']
+        
+        # Process first page
+        new_job_urls = set(re.findall(regex_pattern, initial_html))
+        all_job_urls.update(new_job_urls)
+        
+        # Handle pagination based on detected type
+        page = 2
+        while page <= max_pages:
+            if pagination_info.type == PaginationType.NONE:
+                logger.info("No pagination detected")
+                break
+                
+            # Get next page content based on pagination type
+            if pagination_info.type == PaginationType.PAGE_NUMBERS:
+                page_param = pagination_info.page_param or "page"
+                paginated_url = (f"{url}&{page_param}={page}" 
+                               if "?" in url else f"{url}?{page_param}={page}")
+                html = await self.get_page(paginated_url)
+            elif pagination_info.type in [PaginationType.LOAD_MORE, PaginationType.INFINITE_SCROLL]:
+                if pagination_info.next_page_pattern.pattern:
+                    api_url = pagination_info.next_page_pattern.pattern.format(
+                        page=page,
+                        offset=(page - 1) * pagination_info.items_per_page
+                    )
+                    html = await self.get_page(api_url)
+                else:
+                    logger.error(f"No next page pattern found for {url}")
+                    break
+            
+            if not html:
+                logger.error(f"Failed to fetch page {page}")
+                break
+                
+            new_job_urls = set(re.findall(regex_pattern, html))
+            
+            if not new_job_urls or new_job_urls.issubset(all_job_urls):
+                logger.info(f"No new jobs found on page {page}, stopping pagination")
+                break
+                
+            all_job_urls.update(new_job_urls)
+            logger.info(f"Found {len(new_job_urls)} new jobs on page {page}")
+            page += 1
+            
+            if pagination_info.type in [PaginationType.LOAD_MORE, PaginationType.INFINITE_SCROLL]:
+                await asyncio.sleep(2)
 
-        # Create a semaphore to limit concurrent requests
+        # Process found jobs (rest of the code remains the same)
+        job_urls = list(all_job_urls)
         semaphore = asyncio.Semaphore(max_concurrent)
-
+        
         async def process_job_with_semaphore(job_url: str):
             async with semaphore:
                 full_url = job_url if job_url.startswith("http") else url + job_url
                 await self.fetch_job_details(url, full_url)
 
-        # Modify batch size to respect rate limit (10 requests per minute)
-        rate_limit_batch_size = min(batch_size, 10)  # Never process more than 10 at once
-        
+        rate_limit_batch_size = min(batch_size, 10)
         total_processed = 0
-        logger.info(f"Found {len(job_urls)} jobs to process")
+        logger.info(f"Found total of {len(job_urls)} jobs to process")
 
         for i in range(0, len(job_urls), rate_limit_batch_size):
             batch = job_urls[i:i + rate_limit_batch_size]
@@ -243,7 +305,6 @@ class JobScraper:
                 logger.error(f"Error processing batch {i//rate_limit_batch_size + 1}: {str(e)}")
                 continue
 
-            # Wait for 60 seconds after each batch to respect the rate limit
             logger.info("Waiting 60 seconds to respect rate limit...")
             await asyncio.sleep(60)
 
@@ -256,10 +317,6 @@ class JobScraper:
     async def close(self):
         if self.executor:
             self.executor.shutdown(wait=True)
-        if self.client:
-            await self.client.close()
-        if self.firecrawl_app:
-            await self.firecrawl_app.close()
 
 # Create a singleton instance
 job_scraper = JobScraper()
