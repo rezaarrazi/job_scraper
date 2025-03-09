@@ -2,6 +2,7 @@ from typing import List, Optional
 from pydantic import BaseModel
 from datetime import datetime
 from enum import Enum
+from uuid import UUID
 
 class RegexPatternSchema(BaseModel):
     pattern: str
@@ -30,11 +31,11 @@ class JobDetailPatternSchema(BaseModel):
     benefits_regex_pattern: RegexPatternSchema
 
 class JobResponse(BaseModel):
-    id: int
+    id: UUID
     job_url: str
     company_name: str
     job_title: str
-    location: Optional[str]
+    location: str
     created_at: datetime
     updated_at: datetime
 

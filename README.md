@@ -77,6 +77,12 @@ For each job posting:
 
 ## Usage
 
+There are two ways to use this project:
+
+### 1. As a Script
+
+Create a Python script (e.g., `run_scraper.py`):
+
 ```python
 import asyncio
 from services.job_scraper import job_scraper
@@ -85,6 +91,7 @@ async def main():
     url = "https://example.com/careers"
     async with job_scraper:
         await job_scraper.fetch_jobs(
+            task_id="manual-run",  # For script usage
             url=url,
             batch_size=10,  # Number of jobs to process in each batch
             max_concurrent=5,  # Maximum concurrent requests
@@ -93,6 +100,88 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+```
+
+Run the script:
+```bash
+python run_scraper.py
+```
+
+### 2. As an API Service
+
+The project can be run as a FastAPI service, providing RESTful endpoints to trigger and monitor scraping jobs.
+
+#### Starting the API Server
+
+1. Install additional dependencies:
+```bash
+pip install fastapi uvicorn
+```
+
+2. Run the API server:
+```bash
+uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+#### API Endpoints
+
+##### Start a Scraping Job
+```http
+POST /jobs/scrape
+Content-Type: application/json
+
+{
+    "url": "https://example.com/careers",
+    "batch_size": 10,
+    "max_concurrent": 5,
+    "max_pages": 10
+}
+```
+
+Response:
+```json
+{
+    "task_id": "uuid-task-id"
+}
+```
+
+##### Check Scraping Status
+```http
+GET /jobs/scrape/{task_id}/status
+```
+
+Response:
+```json
+{
+    "task_id": "uuid-task-id",
+    "status": "running",
+    "progress": 45,
+    "error": null,
+    "started_at": "2024-03-14T12:00:00Z",
+    "completed_at": null
+}
+```
+
+##### Get All Scraped Jobs
+```http
+GET /jobs
+```
+
+Response:
+```json
+{
+    "jobs": [
+        {
+            "id": "uuid",
+            "job_url": "https://example.com/careers/job-1",
+            "company_name": "Example Corp",
+            "job_title": "Software Engineer",
+            "location": "Remote",
+            "created_at": "2024-03-14T12:00:00Z",
+            "updated_at": "2024-03-14T12:00:00Z"
+        }
+    ]
+}
 ```
 
 ## Configuration Options
@@ -139,6 +228,7 @@ async def main():
     url = "https://example.com/careers"
     async with job_scraper:
         await job_scraper.fetch_jobs(
+            task_id="manual-run",  # For script usage
             url=url,
             batch_size=10,  # Number of jobs to process in each batch
             max_concurrent=5,  # Maximum concurrent requests
@@ -167,14 +257,14 @@ pip install fastapi uvicorn
 
 2. Run the API server:
 ```bash
-uvicorn api.main:app --host 0.0.0.0 --port 5000 --reload
+uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
 #### API Endpoints
 
-##### Start Scraping Job
+##### Start a Scraping Job
 ```http
-POST /api/scrape
+POST /jobs/scrape
 Content-Type: application/json
 
 {
@@ -182,6 +272,52 @@ Content-Type: application/json
     "batch_size": 10,
     "max_concurrent": 5,
     "max_pages": 10
+}
+```
+
+Response:
+```json
+{
+    "task_id": "uuid-task-id"
+}
+```
+
+##### Check Scraping Status
+```http
+GET /jobs/scrape/{task_id}/status
+```
+
+Response:
+```json
+{
+    "task_id": "uuid-task-id",
+    "status": "running",
+    "progress": 45,
+    "error": null,
+    "started_at": "2024-03-14T12:00:00Z",
+    "completed_at": null
+}
+```
+
+##### Get All Scraped Jobs
+```http
+GET /jobs
+```
+
+Response:
+```json
+{
+    "jobs": [
+        {
+            "id": "uuid",
+            "job_url": "https://example.com/careers/job-1",
+            "company_name": "Example Corp",
+            "job_title": "Software Engineer",
+            "location": "Remote",
+            "created_at": "2024-03-14T12:00:00Z",
+            "updated_at": "2024-03-14T12:00:00Z"
+        }
+    ]
 }
 ```
 

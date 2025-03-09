@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException, Query
 from typing import Dict, List
 from sqlalchemy import select
+from uuid import UUID
 
 from database import AsyncSessionLocal, Job
 from schemas import JobResponse, ScrapeResponse, ScrapeStatusResponse
@@ -71,7 +72,7 @@ async def get_jobs():
             job_list = []
             for job in jobs:
                 job_list.append({
-                    'id': job.id,
+                    'id': str(job.id),
                     'job_url': job.job_url,
                     'company_name': job.company_name,
                     'job_title': job.job_title,
