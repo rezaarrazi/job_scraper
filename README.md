@@ -120,7 +120,7 @@ pip install fastapi uvicorn
 
 2. Run the API server:
 ```bash
-uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+uvicorn api.main:app --host 0.0.0.0 --port 5000 --reload
 ```
 
 #### API Endpoints
@@ -257,7 +257,7 @@ pip install fastapi uvicorn
 
 2. Run the API server:
 ```bash
-uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+uvicorn api.main:app --host 0.0.0.0 --port 5000 --reload
 ```
 
 #### API Endpoints
@@ -325,5 +325,5 @@ Response:
 
 Once the server is running, you can access the interactive API documentation:
 
-- Swagger UI: `http://localhost:8000/docs`
-- ReDoc: `http://localhost:8000/redoc`
+- Swagger UI: `http://localhost:5000/docs`
+- ReDoc: `http://localhost:5000/redoc`
