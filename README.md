@@ -14,7 +14,7 @@ A powerful and intelligent job scraping system that uses AI to automatically ana
 
 ## Prerequisites
 
-- Python 3.8+
+- Python 3.11
 - PostgreSQL database (or Docker for running PostgreSQL)
 - Google AI API key (Gemini)
 - Firecrawl API key
@@ -23,16 +23,22 @@ A powerful and intelligent job scraping system that uses AI to automatically ana
 
 1. Clone the repository:
 ```bash
-git clone <repository-url>
+git clone https://github.com/rezaarrazi/job_scraper.git
 cd job_scrapper
 ```
 
-2. Install dependencies:
+2. Create and activate a conda environment:
+```bash
+conda create -n job_scraper python==3.11
+conda activate job_scraper
+```
+
+3. Install dependencies:
 ```bash
 pip install -r requirements.txt
 ```
 
-3. Set up the database:
+4. Set up the database:
 
    Option 1: Using Docker (Recommended)
    ```bash
@@ -44,7 +50,7 @@ pip install -r requirements.txt
    - Make sure your PostgreSQL server is running
    - Create a new database for the project
 
-4. Set up environment variables:
+5. Set up environment variables:
 ```bash
 # Create a .env file with the following variables
 GOOGLE_API_KEY=your_google_api_key
