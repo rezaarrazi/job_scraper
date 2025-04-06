@@ -1,5 +1,5 @@
 import os
-from playwright.sync_api import sync_playwright
+from playwright_scripts.sync_api import sync_playwright
 from dotenv import load_dotenv
 
 # Load environment variables

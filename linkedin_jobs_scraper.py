@@ -6,9 +6,13 @@ from datetime import datetime
 import time
 from typing import List, Dict
 import csv
+from utils.logger import setup_logger
 
 # Load environment variables
 load_dotenv()
+
+# Setup logger
+logger = setup_logger(__name__)
 
 class LinkedInJobScraper:
     def __init__(self, auth_file: str = None):
@@ -23,7 +27,7 @@ class LinkedInJobScraper:
         """Check if we're authenticated, if not, perform login."""
         if page.url.startswith('https://www.linkedin.com/login'):
             # Need to login
-            print("Logging in to LinkedIn...")
+            logger.info("Logging in to LinkedIn...")
             page.fill('#username', os.getenv('LINKEDIN_USERNAME'))
             page.fill('#password', os.getenv('LINKEDIN_PASSWORD'))
             page.click('button[type="submit"]')
@@ -43,10 +47,10 @@ class LinkedInJobScraper:
             
             # Wait for the job listings page to load with the split view
             page.wait_for_selector('.jobs-search__job-details--wrapper')
-            print("Navigated to full jobs listing page")
+            logger.info("Navigated to full jobs listing page")
             
         except Exception as e:
-            print(f"Error clicking 'Show all jobs': {str(e)}")
+            logger.error(f"Error clicking 'Show all jobs': {str(e)}")
             pass
 
     def extract_job_details(self, page) -> Dict:
@@ -93,7 +97,7 @@ class LinkedInJobScraper:
                 details['skills'] = None
                 
         except Exception as e:
-            print(f"Error extracting job details: {str(e)}")
+            logger.error(f"Error extracting job details: {str(e)}")
             return None
             
         return details
@@ -117,7 +121,7 @@ class LinkedInJobScraper:
         }''')
 
         if scrollable_container:
-            print(f"Found scrollable container with class: {scrollable_container}")
+            logger.info(f"Found scrollable container with class: {scrollable_container}")
             
             # Now use this class for scrolling, but pass the selector as a parameter
             # to avoid JavaScript string interpolation issues
@@ -150,8 +154,10 @@ class LinkedInJobScraper:
                     break
                     
                 last_height = new_height
+
+        page.wait_for_timeout(3000)
     
-    def scrape_company_jobs(self, company_url: str) -> List[Dict]:
+    def scrape_company_jobs(self, company_url: str, organization_name: str) -> List[Dict]:
         """
         Scrape all job listings from a company's LinkedIn jobs page.
         
@@ -175,7 +181,7 @@ class LinkedInJobScraper:
             
             try:
                 # Navigate to the company's jobs page
-                print(f"Navigating to {company_url}")
+                logger.info(f"Navigating to {company_url}")
                 page.goto(company_url)
                 
                 # Check if we need to authenticate
@@ -188,9 +194,10 @@ class LinkedInJobScraper:
                 
                 # Wait for job cards to load
                 page.wait_for_selector('div.jobs-search-results-list__subtitle')
+                page.wait_for_timeout(3000)
 
                 results_count = page.locator('div.jobs-search-results-list__subtitle > span[dir="ltr"]').inner_text()
-                print(f"Found {results_count} job listings")
+                logger.info(f"Found {results_count} job listings")
 
                 self.scroll_to_bottom(page)
 
@@ -207,10 +214,10 @@ class LinkedInJobScraper:
                     return 1;
                 }''')
                 
-                print(f"Total pages to process: {total_pages}")
+                logger.info(f"Total pages to process: {total_pages}")
 
                 while page_number <= total_pages:
-                    print(f"\nProcessing page {page_number} of {total_pages}...")
+                    logger.info(f"\nProcessing page {page_number} of {total_pages}...")
                     
                     # Extract job links from current page
                     job_links = page.evaluate('''() => {
@@ -229,73 +236,62 @@ class LinkedInJobScraper:
                         });
                     }''')
 
-                    print(f"Found {len(job_links)} job listings on page {page_number}")
+                    logger.info(f"Found {len(job_links)} job listings on page {page_number}")
                     all_jobs.extend(job_links)
 
                     # Try to find and click the "Next" button
                     try:
                         if page_number < total_pages:
                             next_button = page.locator('button[aria-label="View next page"]')
-                            print("Clicking next page...")
+                            logger.info("Clicking next page...")
                             next_button.click()
-                            page.wait_for_timeout(2000)  # Wait for the new page to load
+                            page.wait_for_timeout(3000)  # Wait for the new page to load
                             self.scroll_to_bottom(page)
                         page_number += 1
                         
                     except Exception as e:
-                        print(f"Error navigating to next page: {str(e)}")
+                        logger.error(f"Error navigating to next page: {str(e)}")
                         break
 
                 # Save to CSV file
-                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                csv_file = f'./data/output/linkedin_jobs_{timestamp}.csv'
-                
-                with open(csv_file, 'w', encoding='utf-8', newline='') as f:
-                    writer = csv.DictWriter(f, fieldnames=['job_id', 'title', 'url'])
-                    writer.writeheader()
-                    writer.writerows(all_jobs)
-                
-                print(f"\nTotal jobs found across all pages: {len(all_jobs)}")
-                print(f"Saved job listings to {csv_file}")
+                self.save_jobs_to_file(all_jobs, organization_name)
                 
             except Exception as e:
-                print(f"Error during scraping: {str(e)}")
+                logger.error(f"Error during scraping: {str(e)}")
             
             finally:
-                # # Add wait before closing
-                # print("Waiting 10 seconds before closing browser...")
-                # page.wait_for_timeout(10000)  # Wait for 10 seconds (time is in milliseconds)
-                
                 context.close()
                 browser.close()
             
             return jobs
 
-    def save_jobs_to_file(self, jobs: List[Dict], output_file: str = None):
+    def save_jobs_to_file(self, all_jobs: List[Dict], organization_name: str):
         """Save scraped jobs to a JSON file."""
-        if output_file is None:
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            output_file = f'linkedin_jobs_{timestamp}.json'
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        directory = f'./data/output/{organization_name}'
+        os.makedirs(directory, exist_ok=True)
+        
+        csv_file = f'{directory}/linkedin_jobs_{timestamp}.csv'
+        
+        with open(csv_file, 'w', encoding='utf-8', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=['job_id', 'title', 'url'])
+            writer.writeheader()
+            writer.writerows(all_jobs)
             
-        with open(output_file, 'w', encoding='utf-8') as f:
-            json.dump(jobs, f, indent=2, ensure_ascii=False)
-            
-        print(f"Saved {len(jobs)} jobs to {output_file}")
+        logger.info(f"Saved {len(all_jobs)} jobs to {csv_file}")
 
 def main():
     # Example usage
-    company_url = "https://www.linkedin.com/company/mekari/jobs/"
+    organization_name = "mekari"
+    company_url = f"https://www.linkedin.com/company/{organization_name}/jobs/"
     scraper = LinkedInJobScraper()
     
     try:
         # Scrape jobs
-        jobs = scraper.scrape_company_jobs(company_url)
-        
-        # # Save to file
-        # scraper.save_jobs_to_file(jobs)
+        jobs = scraper.scrape_company_jobs(company_url, organization_name)
         
     except Exception as e:
-        print(f"Error during scraping: {str(e)}")
+        logger.error(f"Error during scraping: {str(e)}")
 
 if __name__ == "__main__":
     main() 
