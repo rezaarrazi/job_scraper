@@ -8,6 +8,7 @@ from typing import List, Dict
 import csv
 from utils.logger import setup_logger
 import re
+import argparse
 
 # Load environment variables
 load_dotenv()
@@ -18,10 +19,13 @@ logger = setup_logger(__name__)
 class LinkedInJobScraper:
     def __init__(self, auth_file: str = None):
         """Initialize the scraper with optional authentication file."""
-        self.auth_file = auth_file or os.path.join(
+        if auth_file:
+            auth_file = 'linkedin_auth.json'
+
+        self.auth_file = os.path.join(
             os.path.dirname(__file__), 
             '.auth', 
-            'linkedin_auth.json'
+            auth_file
         )
 
     def ensure_authenticated(self, page) -> bool:
@@ -191,6 +195,12 @@ class LinkedInJobScraper:
                     # Save authentication state for future use
                     context.storage_state(path=self.auth_file)
                 
+                # Check if there are any jobs available
+                empty_jobs_selector = '.org-jobs-empty-jobs-module'
+                if page.locator(empty_jobs_selector).count() > 0:
+                    logger.info("No jobs available for this company")
+                    return []
+                
                 # Click "Show all jobs" button to get the full listing
                 self.click_show_all_jobs(page)
                 
@@ -332,17 +342,29 @@ class LinkedInJobScraper:
         return jobs
 
 def main():
-    # Example usage
-    organization_name = "mekari"
-    company_url = f"https://www.linkedin.com/company/{organization_name}/jobs/"
-    scraper = LinkedInJobScraper()
+    """Main function to run the LinkedIn job scraper."""
+    parser = argparse.ArgumentParser(description='Scrape job listings from a company\'s LinkedIn page')
+    parser.add_argument('linkedin_url', 
+                       help='URL of the company\'s LinkedIn jobs page (e.g., https://www.linkedin.com/company/mekari/jobs/)')
+    parser.add_argument('organization_name', 
+                       help='Name of the organization to use in output files')
+    parser.add_argument('--auth-file', 
+                       default='linkedin_auth.json',
+                       help='Path to the authentication state file (default: linkedin_auth.json)')
     
-    try:
-        # Scrape jobs
-        jobs = scraper.scrape_company_jobs(company_url, organization_name)
-        
-    except Exception as e:
-        logger.error(f"Error during scraping: {str(e)}")
+    args = parser.parse_args()
+    
+    # Initialize the scraper
+    scraper = LinkedInJobScraper(auth_file=args.auth_file)
+    
+    # Scrape jobs
+    linkedin_jobs_url = f"{args.linkedin_url}/jobs/"
+    jobs = scraper.scrape_company_jobs(linkedin_jobs_url, args.organization_name)
+    
+    if jobs:
+        logger.info(f"Successfully scraped {len(jobs)} jobs from {args.organization_name}")
+    else:
+        logger.error("No jobs were scraped")
 
 if __name__ == "__main__":
     main() 
