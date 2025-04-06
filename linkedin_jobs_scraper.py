@@ -7,6 +7,7 @@ import time
 from typing import List, Dict
 import csv
 from utils.logger import setup_logger
+import re
 
 # Load environment variables
 load_dotenv()
@@ -164,11 +165,12 @@ class LinkedInJobScraper:
         Args:
             company_url: URL of the company's LinkedIn jobs page
                        (e.g., 'https://www.linkedin.com/company/mekari/jobs/')
+            organization_name: Name of the organization being scraped
         
         Returns:
             List of dictionaries containing job details
         """
-        jobs = []
+        all_jobs = []
         
         with sync_playwright() as p:
             # Launch browser with saved authentication if available
@@ -201,7 +203,6 @@ class LinkedInJobScraper:
 
                 self.scroll_to_bottom(page)
 
-                all_jobs = []
                 page_number = 1
 
                 # Get total number of pages
@@ -216,28 +217,22 @@ class LinkedInJobScraper:
                 
                 logger.info(f"Total pages to process: {total_pages}")
 
+                dir_prefix_date = datetime.now().strftime('%Y%m%d_%H%M%S')
+
                 while page_number <= total_pages:
                     logger.info(f"\nProcessing page {page_number} of {total_pages}...")
-                    
-                    # Extract job links from current page
-                    job_links = page.evaluate('''() => {
-                        const links = Array.from(document.querySelectorAll('a.job-card-container__link'));
-                        return links.map(link => {
-                            // Extract job ID from URL
-                            const url = link.href;
-                            const jobIdMatch = url.match(/\/jobs\/view\/(\d+)\//);
-                            const jobId = jobIdMatch ? jobIdMatch[1] : '';
-                            
-                            return {
-                                title: link.querySelector('span strong')?.textContent.trim() || '',
-                                url: link.href,
-                                job_id: jobId
-                            };
-                        });
-                    }''')
 
-                    logger.info(f"Found {len(job_links)} job listings on page {page_number}")
-                    all_jobs.extend(job_links)
+                    # # save the page html content to a file
+                    # page_content = page.content()
+                    # directory = f'./data/output/{organization_name}/{dir_prefix_date}/html'
+                    # os.makedirs(directory, exist_ok=True)
+                    # with open(f'{directory}/page_{page_number}.html', 'w', encoding='utf-8') as f:
+                    #     f.write(page_content)
+                    
+                    # Extract job information from current page using the new method
+                    page_jobs = self.extract_job_cards(page)
+                    logger.info(f"Found {len(page_jobs)} job listings on page {page_number}")
+                    all_jobs.extend(page_jobs)
 
                     # Try to find and click the "Next" button
                     try:
@@ -254,7 +249,7 @@ class LinkedInJobScraper:
                         break
 
                 # Save to CSV file
-                self.save_jobs_to_file(all_jobs, organization_name)
+                self.save_jobs_to_file(all_jobs, organization_name, dir_prefix_date)
                 
             except Exception as e:
                 logger.error(f"Error during scraping: {str(e)}")
@@ -263,22 +258,78 @@ class LinkedInJobScraper:
                 context.close()
                 browser.close()
             
-            return jobs
+            return all_jobs
 
-    def save_jobs_to_file(self, all_jobs: List[Dict], organization_name: str):
+    def save_jobs_to_file(self, all_jobs: List[Dict], organization_name: str, dir_prefix_date: str):
         """Save scraped jobs to a JSON file."""
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        directory = f'./data/output/{organization_name}'
+        directory = f'./data/output/{organization_name}/{dir_prefix_date}'
         os.makedirs(directory, exist_ok=True)
         
-        csv_file = f'{directory}/linkedin_jobs_{timestamp}.csv'
+        csv_file = f'{directory}/linkedin_jobs.csv'
         
         with open(csv_file, 'w', encoding='utf-8', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=['job_id', 'title', 'url'])
+            writer = csv.DictWriter(f, fieldnames=['job_id', 'job_title', 'job_url', 'company_name', 'location'])
             writer.writeheader()
             writer.writerows(all_jobs)
             
         logger.info(f"Saved {len(all_jobs)} jobs to {csv_file}")
+
+    def extract_job_cards(self, page) -> List[Dict]:
+        """Extract job information from job cards in the search results."""
+        jobs = []
+        
+        try:
+            # Wait for job cards to be visible
+            page.wait_for_selector('div.job-card-container', state='visible')
+            
+            # Get all job cards
+            job_cards = page.locator('div.job-card-container').all()
+            
+            for card in job_cards:
+                job_info = {}
+                
+                try:
+                    # Extract job link and ID
+                    job_link = card.locator('a.job-card-container__link').first
+                    if job_link:
+                        href = job_link.get_attribute('href')
+
+                        if href:
+                            if '/jobs/view/' not in href:
+                                continue    
+                            
+                            job_info['job_url'] = href
+                            # Extract job ID from URL
+                            job_id_match = re.search(r'/jobs/view/(\d+)/', href)
+                            if job_id_match:
+                                job_info['job_id'] = job_id_match.group(1)
+                    
+                            # Extract job title
+                            title_elem = card.locator('a.job-card-container__link span[aria-hidden="true"] strong').first
+                            if title_elem:
+                                job_info['job_title'] = title_elem.inner_text().strip()
+                            
+                            # Extract company name - look for the subtitle span
+                            company_elem = card.locator('div.artdeco-entity-lockup__subtitle span').first
+                            if company_elem:
+                                job_info['company_name'] = company_elem.inner_text().strip()
+                            
+                            # Extract location - look for the metadata list item
+                            location_elem = card.locator('ul.job-card-container__metadata-wrapper li span').first
+                            if location_elem:
+                                job_info['location'] = location_elem.inner_text().strip()
+                            
+                            if job_info:  # Only add if we got at least some information
+                                jobs.append(job_info)
+                        
+                except Exception as e:
+                    logger.error(f"Error extracting job card details: {str(e)}")
+                    continue
+                    
+        except Exception as e:
+            logger.error(f"Error extracting job cards: {str(e)}")
+            
+        return jobs
 
 def main():
     # Example usage
