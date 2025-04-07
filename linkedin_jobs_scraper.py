@@ -7,7 +7,8 @@ import csv
 from utils.logger import setup_logger
 import re
 import argparse
-
+import json
+from tqdm import tqdm
 # Load environment variables
 load_dotenv()
 
@@ -160,6 +161,68 @@ class LinkedInJobScraper:
 
         page.wait_for_timeout(3000)
     
+    def get_job_details(self, page, linkedin_job_url) -> Dict:
+        """Get job details from the page."""
+        details = {}
+
+        # open one of the linkedin_job_url and save the html content to a file
+        page.goto(f"https://www.linkedin.com{linkedin_job_url}")
+        
+        # Click the "See more" button to show full description
+        try:
+            see_more_button = page.locator('button[aria-label="Click to see more description"]')
+            if see_more_button.count() > 0:
+                see_more_button.click()
+                page.wait_for_timeout(2000)  # Wait for description to expand
+        except Exception as e:
+            logger.error(f"Error clicking 'See more' button: {str(e)}")
+
+        # Extract job insights
+        try:
+            # Get all job insight items
+            job_insights = page.locator('.job-details-jobs-unified-top-card__job-insight').all()
+            insights = []
+            
+            for insight in job_insights[:3]:
+                # Get all spans within the insight that contain the actual text
+                spans = insight.locator('span[dir="ltr"]').all()
+                for span in spans:
+                    text = span.inner_text().strip()
+                    if text:  # Only add non-empty text
+                        insights.append(text)
+            
+            details["work_arrangement"] = insights[0]
+            details["contract_type"] = insights[1]
+            details["seniority_level"] = insights[2]
+            
+        except Exception as e:
+            logger.error(f"Error extracting job insights: {str(e)}")
+
+        
+        try:
+            # Get all <code> elements
+            code_elements = page.locator("code")
+            count = code_elements.count()
+
+            data = {}
+            for i in range(count):
+                content = code_elements.nth(i).text_content()
+                if content and "applyMethod" in content:
+                    try:
+                        json_data = json.loads(content).get("data", {})
+                        if "applyMethod" in json_data:
+                            data = json_data
+                    except json.JSONDecodeError:
+                        continue
+        
+            details["company_apply_url"] = data.get("applyMethod", {}).get("companyApplyUrl", "")
+            details["description"] = data.get("description", {}).get("text", "")
+
+        except Exception as e:
+            logger.error(f"Error extracting job data from code tag: {str(e)}")
+        
+        return details
+    
     def scrape_company_jobs(self, company_url: str, organization_name: str, headless: bool = True) -> List[Dict]:
         """
         Scrape all job listings from a company's LinkedIn jobs page.
@@ -226,6 +289,7 @@ class LinkedInJobScraper:
                 logger.info(f"Total pages to process: {total_pages}")
 
                 dir_prefix_date = datetime.now().strftime('%Y%m%d_%H%M%S')
+                total_pages = 1
 
                 while page_number <= total_pages:
                     logger.info(f"\nProcessing page {page_number} of {total_pages}...")
@@ -255,6 +319,11 @@ class LinkedInJobScraper:
                     except Exception as e:
                         logger.error(f"Error navigating to next page: {str(e)}")
                         break
+                
+                # iterate all_jobs and get details from each job from linkedin_job_url
+                for job in tqdm(all_jobs, desc="Getting job details"):
+                    job_details = self.get_job_details(page, job['linkedin_job_url'])
+                    job.update(job_details)
 
                 # Save to CSV file
                 self.save_jobs_to_file(all_jobs, organization_name, dir_prefix_date)
@@ -276,7 +345,8 @@ class LinkedInJobScraper:
         csv_file = f'{directory}/linkedin_jobs.csv'
         
         with open(csv_file, 'w', encoding='utf-8', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=['job_id', 'job_title', 'job_url', 'company_name', 'location'])
+            fieldnames = list(all_jobs[0].keys())
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(all_jobs)
             
@@ -306,7 +376,7 @@ class LinkedInJobScraper:
                             if '/jobs/view/' not in href:
                                 continue    
                             
-                            job_info['job_url'] = href
+                            job_info['linkedin_job_url'] = href
                             # Extract job ID from URL
                             job_id_match = re.search(r'/jobs/view/(\d+)/', href)
                             if job_id_match:
@@ -351,7 +421,6 @@ def main():
                        help='Path to the authentication state file (default: linkedin_auth.json)')
     parser.add_argument('--headless', 
                        action='store_true',
-                       default=True,
                        help='Run in headless mode')
     
     args = parser.parse_args()
