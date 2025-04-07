@@ -1,9 +1,7 @@
 import os
 from playwright.sync_api import sync_playwright
 from dotenv import load_dotenv
-import json
 from datetime import datetime
-import time
 from typing import List, Dict
 import csv
 from utils.logger import setup_logger
@@ -162,7 +160,7 @@ class LinkedInJobScraper:
 
         page.wait_for_timeout(3000)
     
-    def scrape_company_jobs(self, company_url: str, organization_name: str) -> List[Dict]:
+    def scrape_company_jobs(self, company_url: str, organization_name: str, headless: bool = True) -> List[Dict]:
         """
         Scrape all job listings from a company's LinkedIn jobs page.
         
@@ -178,7 +176,7 @@ class LinkedInJobScraper:
         
         with sync_playwright() as p:
             # Launch browser with saved authentication if available
-            browser = p.chromium.launch(headless=False)  # Set to True in production
+            browser = p.chromium.launch(headless=headless)  # Set to True in production
             context = browser.new_context(
                 storage_state=self.auth_file if os.path.exists(self.auth_file) else None
             )
@@ -234,7 +232,7 @@ class LinkedInJobScraper:
 
                     # # save the page html content to a file
                     # page_content = page.content()
-                    # directory = f'./data/output/{organization_name}/{dir_prefix_date}/html'
+                    # directory = f'./data/output/{dir_prefix_date}/{organization_name}/html'
                     # os.makedirs(directory, exist_ok=True)
                     # with open(f'{directory}/page_{page_number}.html', 'w', encoding='utf-8') as f:
                     #     f.write(page_content)
@@ -272,7 +270,7 @@ class LinkedInJobScraper:
 
     def save_jobs_to_file(self, all_jobs: List[Dict], organization_name: str, dir_prefix_date: str):
         """Save scraped jobs to a JSON file."""
-        directory = f'./data/output/{organization_name}/{dir_prefix_date}'
+        directory = f'./data/output/{dir_prefix_date}/{organization_name}'
         os.makedirs(directory, exist_ok=True)
         
         csv_file = f'{directory}/linkedin_jobs.csv'
@@ -351,6 +349,10 @@ def main():
     parser.add_argument('--auth-file', 
                        default='linkedin_auth.json',
                        help='Path to the authentication state file (default: linkedin_auth.json)')
+    parser.add_argument('--headless', 
+                       action='store_true',
+                       default=True,
+                       help='Run in headless mode')
     
     args = parser.parse_args()
     
@@ -358,8 +360,10 @@ def main():
     scraper = LinkedInJobScraper(auth_file=args.auth_file)
     
     # Scrape jobs
-    linkedin_jobs_url = f"{args.linkedin_url}/jobs/"
-    jobs = scraper.scrape_company_jobs(linkedin_jobs_url, args.organization_name)
+    # Ensure the URL ends with /jobs/ by removing any trailing slash first
+    base_url = args.linkedin_url.rstrip('/')
+    linkedin_jobs_url = f"{base_url}/jobs/"
+    jobs = scraper.scrape_company_jobs(linkedin_jobs_url, args.organization_name, args.headless)
     
     if jobs:
         logger.info(f"Successfully scraped {len(jobs)} jobs from {args.organization_name}")
