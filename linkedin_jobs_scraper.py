@@ -57,55 +57,6 @@ class LinkedInJobScraper:
             logger.error(f"Error clicking 'Show all jobs': {str(e)}")
             pass
 
-    def extract_job_details(self, page) -> Dict:
-        """Extract details from the job details panel."""
-        details = {}
-        
-        try:
-            # Wait for the job details wrapper to be visible
-            details_wrapper = '.jobs-search__job-details--wrapper'
-            page.wait_for_selector(details_wrapper, state='visible')
-            
-            # Wait for the content to load in the details panel
-            page.wait_for_selector('.jobs-unified-top-card__job-title', state='visible')
-            
-            # Extract basic information
-            details['title'] = page.locator('.jobs-unified-top-card__job-title').inner_text()
-            details['company'] = page.locator('.jobs-unified-top-card__company-name').inner_text()
-            details['location'] = page.locator('.jobs-unified-top-card__bullet').inner_text()
-            
-            # Extract job description
-            description_selector = '.jobs-description__content'
-            page.wait_for_selector(description_selector)
-            details['description'] = page.locator(description_selector).inner_text()
-            
-            # Extract posting date
-            try:
-                details['posted_date'] = page.locator('.jobs-unified-top-card__posted-date').inner_text()
-            except:
-                details['posted_date'] = None
-            
-            # Extract employment type and other metadata
-            try:
-                metadata_items = page.locator('.jobs-unified-top-card__job-insight').all()
-                details['metadata'] = [item.inner_text() for item in metadata_items]
-            except:
-                details['metadata'] = []
-            
-            # Extract skills if available
-            try:
-                skills_selector = '.jobs-description__content .description__skills'
-                if page.locator(skills_selector).count() > 0:
-                    details['skills'] = page.locator(skills_selector).inner_text()
-            except:
-                details['skills'] = None
-                
-        except Exception as e:
-            logger.error(f"Error extracting job details: {str(e)}")
-            return None
-            
-        return details
-
     def scroll_to_bottom(self, page):
         """Scroll to the bottom of the page."""
         # First, get the dynamic class name of the scrollable container
@@ -125,7 +76,7 @@ class LinkedInJobScraper:
         }''')
 
         if scrollable_container:
-            logger.info(f"Found scrollable container with class: {scrollable_container}")
+            # logger.info(f"Found scrollable container with class: {scrollable_container}")
             
             # Now use this class for scrolling, but pass the selector as a parameter
             # to avoid JavaScript string interpolation issues
@@ -159,7 +110,7 @@ class LinkedInJobScraper:
                     
                 last_height = new_height
 
-        page.wait_for_timeout(3000)
+        # page.wait_for_timeout(3000)
     
     def get_job_details(self, page, linkedin_job_url) -> Dict:
         """Get job details from the page."""
@@ -167,33 +118,25 @@ class LinkedInJobScraper:
 
         # open one of the linkedin_job_url and save the html content to a file
         page.goto(f"https://www.linkedin.com{linkedin_job_url}")
-        
-        # Click the "See more" button to show full description
-        try:
-            see_more_button = page.locator('button[aria-label="Click to see more description"]')
-            if see_more_button.count() > 0:
-                see_more_button.click()
-                page.wait_for_timeout(2000)  # Wait for description to expand
-        except Exception as e:
-            logger.error(f"Error clicking 'See more' button: {str(e)}")
 
         # Extract job insights
         try:
-            # Get all job insight items
-            job_insights = page.locator('.job-details-jobs-unified-top-card__job-insight').all()
-            insights = []
+            # Get the first relevant <li>
+            first_li = page.locator("li.job-details-jobs-unified-top-card__job-insight.job-details-jobs-unified-top-card__job-insight--highlight").first
+
+            # Select spans that are two levels down: <li> > <span> > <span>
+            label_spans = first_li.locator(":scope > span > span")
+
+            values = [label_spans.nth(i).text_content().strip() for i in range(label_spans.count())]
+
+            # Assign values safely
+            work_arrangement = values[0] if len(values) == 3 else None
+            contract_type = values[1] if len(values) == 3 else values[0] if len(values) >= 1 else None
+            seniority_level = values[2] if len(values) == 3 else values[1] if len(values) == 2 else None
             
-            for insight in job_insights[:3]:
-                # Get all spans within the insight that contain the actual text
-                spans = insight.locator('span[dir="ltr"]').all()
-                for span in spans:
-                    text = span.inner_text().strip()
-                    if text:  # Only add non-empty text
-                        insights.append(text)
-            
-            details["work_arrangement"] = insights[0]
-            details["contract_type"] = insights[1]
-            details["seniority_level"] = insights[2]
+            details["work_arrangement"] = work_arrangement
+            details["contract_type"] = contract_type
+            details["seniority_level"] = seniority_level
             
         except Exception as e:
             logger.error(f"Error extracting job insights: {str(e)}")
@@ -311,7 +254,7 @@ class LinkedInJobScraper:
                             next_button = page.locator('button[aria-label="View next page"]')
                             logger.info("Clicking next page...")
                             next_button.click()
-                            page.wait_for_timeout(3000)  # Wait for the new page to load
+                            page.wait_for_timeout(1000)  # Wait for the new page to load
                             self.scroll_to_bottom(page)
                         page_number += 1
                         
