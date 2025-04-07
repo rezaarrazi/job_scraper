@@ -289,7 +289,6 @@ class LinkedInJobScraper:
                 logger.info(f"Total pages to process: {total_pages}")
 
                 dir_prefix_date = datetime.now().strftime('%Y%m%d_%H%M%S')
-                total_pages = 1
 
                 while page_number <= total_pages:
                     logger.info(f"\nProcessing page {page_number} of {total_pages}...")
