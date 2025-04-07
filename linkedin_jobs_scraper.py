@@ -166,7 +166,7 @@ class LinkedInJobScraper:
         
         return details
     
-    def scrape_company_jobs(self, company_url: str, organization_name: str, headless: bool = True) -> List[Dict]:
+    def scrape_company_jobs(self, company_url: str, organization_name: str, dir_prefix_date: str, headless: bool = True) -> List[Dict]:
         """
         Scrape all job listings from a company's LinkedIn jobs page.
         
@@ -230,8 +230,6 @@ class LinkedInJobScraper:
                 }''')
                 
                 logger.info(f"Total pages to process: {total_pages}")
-
-                dir_prefix_date = datetime.now().strftime('%Y%m%d_%H%M%S')
 
                 while page_number <= total_pages:
                     logger.info(f"\nProcessing page {page_number} of {total_pages}...")
@@ -354,10 +352,12 @@ class LinkedInJobScraper:
 def main():
     """Main function to run the LinkedIn job scraper."""
     parser = argparse.ArgumentParser(description='Scrape job listings from a company\'s LinkedIn page')
-    parser.add_argument('linkedin_url', 
+    parser.add_argument('--linkedin-url', 
                        help='URL of the company\'s LinkedIn jobs page (e.g., https://www.linkedin.com/company/mekari/jobs/)')
-    parser.add_argument('organization_name', 
+    parser.add_argument('--organization-name', 
                        help='Name of the organization to use in output files')
+    parser.add_argument('--companies-data-file',
+                       help='Path to CSV file containing company data with "Organization Name" and "LinkedIn" columns')
     parser.add_argument('--auth-file', 
                        default='linkedin_auth.json',
                        help='Path to the authentication state file (default: linkedin_auth.json)')
@@ -369,17 +369,59 @@ def main():
     
     # Initialize the scraper
     scraper = LinkedInJobScraper(auth_file=args.auth_file)
+
+    dir_prefix_date = datetime.now().strftime('%Y%m%d_%H%M%S')
     
-    # Scrape jobs
-    # Ensure the URL ends with /jobs/ by removing any trailing slash first
-    base_url = args.linkedin_url.rstrip('/')
-    linkedin_jobs_url = f"{base_url}/jobs/"
-    jobs = scraper.scrape_company_jobs(linkedin_jobs_url, args.organization_name, args.headless)
-    
-    if jobs:
-        logger.info(f"Successfully scraped {len(jobs)} jobs from {args.organization_name}")
+    if args.companies_data_file:
+        # Process companies from CSV file
+        try:
+            import pandas as pd
+            companies_df = pd.read_csv(args.companies_data_file)
+            required_columns = ['Organization Name', 'LinkedIn']
+            
+            if not all(col in companies_df.columns for col in required_columns):
+                logger.error(f"CSV file must contain columns: {required_columns}")
+                return
+                
+            total_companies = len(companies_df)
+            logger.info(f"Found {total_companies} companies to process")
+            
+            for idx, row in companies_df.iterrows():
+                current = idx + 1
+                org_name = row['Organization Name']
+                linkedin_url = row['LinkedIn']
+                
+                if pd.isna(linkedin_url) or not linkedin_url:
+                    logger.warning(f"[{current}/{total_companies}] Skipping {org_name} - no LinkedIn URL provided")
+                    continue
+                    
+                # Ensure the URL ends with /jobs/ by removing any trailing slash first
+                base_url = linkedin_url.rstrip('/')
+                linkedin_jobs_url = f"{base_url}/jobs/"
+                
+                logger.info(f"[{current}/{total_companies}] Processing {org_name} - {linkedin_jobs_url}")
+                jobs = scraper.scrape_company_jobs(linkedin_jobs_url, org_name, dir_prefix_date, args.headless)
+                
+                if jobs:
+                    logger.info(f"[{current}/{total_companies}] Successfully scraped {len(jobs)} jobs from {org_name}")
+                else:
+                    logger.warning(f"[{current}/{total_companies}] No jobs were scraped for {org_name}")
+                    
+        except Exception as e:
+            logger.error(f"Error processing companies data file: {str(e)}")
+            
+    elif args.linkedin_url and args.organization_name:
+        # Process single company
+        base_url = args.linkedin_url.rstrip('/')
+        linkedin_jobs_url = f"{base_url}/jobs/"
+        jobs = scraper.scrape_company_jobs(linkedin_jobs_url, args.organization_name, dir_prefix_date, args.headless)
+        
+        if jobs:
+            logger.info(f"Successfully scraped {len(jobs)} jobs from {args.organization_name}")
+        else:
+            logger.error("No jobs were scraped")
     else:
-        logger.error("No jobs were scraped")
+        logger.error("Either provide both --linkedin-url and --organization-name, or --companies-data-file")
 
 if __name__ == "__main__":
     main() 
