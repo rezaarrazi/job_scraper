@@ -9,6 +9,8 @@ import re
 import argparse
 import json
 from tqdm import tqdm
+import time
+import random
 # Load environment variables
 load_dotenv()
 
@@ -358,6 +360,10 @@ def main():
                        help='Name of the organization to use in output files')
     parser.add_argument('--companies-data-file',
                        help='Path to CSV file containing company data with "Organization Name" and "LinkedIn" columns')
+    parser.add_argument('--start-index',
+                       type=int,
+                       default=0,
+                       help='Index to start processing from in the CSV file (default: 0)')
     parser.add_argument('--auth-file', 
                        default='linkedin_auth.json',
                        help='Path to the authentication state file (default: linkedin_auth.json)')
@@ -384,9 +390,14 @@ def main():
                 return
                 
             total_companies = len(companies_df)
+            if args.start_index >= total_companies:
+                logger.error(f"Start index {args.start_index} is out of range. File has {total_companies} companies.")
+                return
+                
             logger.info(f"Found {total_companies} companies to process")
+            logger.info(f"Starting from index {args.start_index}")
             
-            for idx, row in companies_df.iterrows():
+            for idx, row in companies_df.iloc[args.start_index:].iterrows():
                 current = idx + 1
                 org_name = row['Organization Name']
                 linkedin_url = row['LinkedIn']
@@ -406,6 +417,10 @@ def main():
                     logger.info(f"[{current}/{total_companies}] Successfully scraped {len(jobs)} jobs from {org_name}")
                 else:
                     logger.warning(f"[{current}/{total_companies}] No jobs were scraped for {org_name}")
+                
+                wait_time = random.randint(1, 5)
+                logger.info(f"Waiting {wait_time} seconds before next company...")
+                time.sleep(wait_time)
                     
         except Exception as e:
             logger.error(f"Error processing companies data file: {str(e)}")

@@ -8,9 +8,9 @@ logs_dir = Path("logs")
 logs_dir.mkdir(exist_ok=True)
 
 # Configure logging
-def setup_logger(name: str) -> logging.Logger:
+def setup_logger(name: str, level: int = logging.INFO) -> logging.Logger:
     logger = logging.getLogger(name)
-    logger.setLevel(logging.INFO)
+    logger.setLevel(level)
 
     # Format for the logs
     formatter = logging.Formatter(
