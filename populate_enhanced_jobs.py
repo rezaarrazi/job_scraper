@@ -11,6 +11,7 @@ from utils.logger import setup_logger
 import logging
 from dotenv import load_dotenv
 from tqdm import tqdm
+from datetime import datetime
 
 load_dotenv()
 
@@ -24,119 +25,192 @@ logger = setup_logger(__name__, level=logging.DEBUG)
 
 # --- Schema Definition ---
 class JobExtraction(BaseModel):
-    job_title: str = Field(..., description="Title of the job position")
-    job_type: Optional[str] = Field(None, description="Type of employment (Full-time, Part-time, etc.)")
-    location: Optional[str] = Field(None, description="Job location")
-    experience_level: Optional[str] = Field(None, description="Experience level required")
-    min_experience: Optional[int] = Field(None, description="Minimum years of experience required")
-    max_experience: Optional[int] = Field(None, description="Maximum years of experience required")
-    description: str = Field(..., description="Complete job description")
-    responsibilities: List[str] = Field(default_factory=list, description="List of job responsibilities")
-    required_skills: List[str] = Field(default_factory=list, description="List of required skills")
-    preferred_skills: List[str] = Field(default_factory=list, description="List of preferred skills")
-    skills_tag: List[str] = Field(default_factory=list, description="List of skill tags")
-    language_requirements: List[str] = Field(default_factory=list, description="List of language requirements")
+    job_title: str
+    company_name: str
+    company_logo_url: str
+    company_industries: List[str]
+    contract_type: str
+    location: str
+    experience_level: str
+    min_experience: int
+    max_experience: int
+    description: str
+    responsibilities: List[str]
+    required_profile: List[str]
+    preferred_profile: List[str]
+    skills_tag: List[str]
+    language_requirements: List[str]
+    work_arrangement: str
+    linkedin_job_url: Optional[str]
+    benefits: List[str]
+    salary_range: str
+    url: str
+    is_external: bool
+    minimum_education_level: str
 
 JOB_EXTRACTION_PROMPT = '''
 You are an expert assistant tasked with extracting structured data from job postings.
+Given a full job description, extract and format the following fields clearly and detailly.
 
-Given a full job description, extract and format the following fields clearly and concisely. Try to fill in all fields with reasonable inferences when explicit information is not available. Avoid leaving fields empty unless absolutely necessary.
+### Field Guidelines:
 
-1. **Job Title**
-   - The official title of the position
-   - Should be specific and match the company's terminology
-   - Always translate the job title to English
-   - Example: "Senior Software Engineer" or "Product Manager"
+1. **jobTitle**
+   * The official title of the position
+   * Should be specific and match the company's terminology
+   * Always translate to English
+   * Example: `"Senior Software Engineer"`
 
-2. **Job Type**
-   - The employment arrangement type
-   - Common values: Full-time, Part-time, Contract, Internship
-   - If not specified, infer from context (e.g., if it's a permanent role, assume Full-time)
-   - Example: "Full-time" or "Contract"
+2. **companyName**
+   * The company offering the job
+   * Use the name mentioned in the job description or job metadata
+   * Example: `"Tokopedia"`
 
-3. **Location**
-   - Where the job is located
-   - Format: "City, State/Province, Country"
-   - If any part is missing, use available parts
-   - If not specified, infer from company location or job context
-   - Examples: 
-     * "San Francisco, CA, United States"
-     * "Jakarta, DKI Jakarta, Indonesia"
-     * "Remote, United States"
+3. **companyLogoUrl**
+   * The URL of the company logo
+   * If not stated, leave it empty like `""`
 
-4. **Experience Level**
-   - The seniority level required for the position
-   - Common values: Entry, Mid, Senior, Lead, Principal
-   - If not specified, infer from job title and requirements
-   - Example: "Senior" or "Entry Level"
+4. **companyIndustries**
+   * List of industries the company is in, use the industry mentioned in the job description or job metadata
+   * The industry should be specific, not general. For example, "Technology" is not a specific industry, but "E-commerce" or "Fintech" is. And don't write short form of the industry, for example, "Tech", "AI" is not a specific industry, but "Information Technology" or "Artificial Intelligence" is.
+   * If not stated, infer from job description, default to `["Other"]`
+   * Example: `["E-commerce", "Fintech"]`
 
-5. **Minimum Experience**
-   - The minimum number of years of experience required
-   - Should be a whole number
-   - If not explicitly mentioned, infer from experience level:
-     * Entry/Junior: 0-2 years
-     * Mid/Intermediate: 2-5 years
-     * Senior: 5-10 years
-     * Lead/Principal: 8-15 years
-   - Example: 2 or 5
+5. **contractType**
+   * Strictly select from the following list:
+        - `"Full-Time"` : for full-time or permanent positions
+        - `"Part-Time"` : for part-time positions
+        - `"Contract"` : for contract or temporary positions
+        - `"Freelance"` : for freelance positions
+        - `"Internship"` : for internship positions
+        - `"Other"` : for other contract types
+   * If not stated, infer based on context, default to `"Full-time"`
 
-6. **Maximum Experience**
-   - The maximum number of years of experience required
-   - Should be a whole number
-   - If not explicitly mentioned, infer from experience level using the ranges above
-   - Example: 5 or 10
+6. **location**
+   * Format: `"City, State/Province, Country"`
+   * If missing, infer from job or company context
 
-7. **Description**
-   - A comprehensive overview of the job
-   - Should include the main purpose and scope of the role
-   - Keep it concise but informative
-   - If not provided, create a summary based on the job title and requirements
-   - Always translate the description to English
+7. **experienceLevel**
+   * Reformulate the experience level from the job title and description, select from the following:
+        - `"Entry-Level"`
+        - `"Mid-Level"`  
+        - `"Senior-Level"`  
+        - `"Lead"`  
+        - `"Director"`  
+        - `"Executive"`
+   * If not stated, infer from title and description, default to `"Entry-Level"`
 
-8. **Responsibilities**
-   - List of key duties and responsibilities
-   - Each item should be a clear, actionable statement
-   - If not explicitly listed, infer from the job description by identifying key duties and tasks
-   - Example: ["Lead development team", "Design system architecture"]
+8. **minExperience**
+   * Integer: minimum required years of experience
+   * If not stated, infer:
+     * Entry: 0-2
+     * Mid: 2-5
+     * Senior: 5-10
+     * Lead+: 8-15
 
-9. **Required Skills**
-   - Essential skills and qualifications
-   - Technical skills, tools, and technologies
-   - If not explicitly listed, infer from the job description by identifying:
-     * Technical requirements mentioned
-     * Tools and technologies referenced
-     * Required qualifications
-   - Example: ["Python", "AWS", "Docker"]
+9. **maxExperience**
+   * Integer: maximum years of experience
+   * Leave it empty if not stated
 
-10. **Preferred Skills**
-    - Desirable but not mandatory skills
-    - Additional qualifications that would be beneficial
-    - If not explicitly listed, infer from the job description by identifying:
-      * Nice-to-have technologies
-      * Additional qualifications mentioned
-      * Related skills that would be beneficial
-    - Example: ["Kubernetes", "Machine Learning"]
+10. **description**
+    * A detailed description of the job role, including its purpose, scope, and expectations.
+    * Translate to English if needed
+    * Highlight role purpose and expectations
 
-11. **Skills Tag**
-    - Keywords and tags related to the role
-    - Used for categorization and search
-    - If not explicitly listed, infer from:
-      * Job title
-      * Required and preferred skills
-      * Industry and domain knowledge mentioned
-    - Example: ["Backend", "Cloud", "DevOps"]
+11. **responsibilities**
+    * A structured list outlining the key duties and responsibilities associated with this role.
+    * Use action-oriented statements
+    * If not explicitly listed, extract from job body
 
-12. **Language Requirements**
-    - Required language proficiencies
-    - Include level if specified (e.g., "Fluent", "Native")
-    - If not explicitly mentioned:
-      * Check the language of the job description
-      * Infer from the job location and company context
-      * Consider common language requirements for the role
-      * Most likely the default required language is Bahasa Indonesia except for the job location is outside Indonesia
-    - Example: ["Bahasa Indonesia", "English", "Spanish"]
+12. **requiredProfile**
+    * List of essential qualifications or skills
+    * Can include:
+      * Technical skills (e.g., Java, SQL)
+      * Soft skills (e.g., collaboration)
+      * Education (e.g., Bachelor's in Computer Science)
+      * Certifications (e.g., AWS Certified Developer)
+    * Elaborate each item in the list
+    * If not listed, infer based on job description, responsibilities and role type
+    * Try to not leave it empty
 
-Format the output as a JSON object. All list-based fields must be proper JSON arrays. Try to fill in all fields with reasonable inferences when explicit information is not available. Only use `null` or empty lists as a last resort when no reasonable inference can be made.
+13. **preferredProfile**
+    * A list of additional, nice-to-have skills that would be beneficial but are not mandatory. 
+    * Includes:
+      * Advanced degrees
+      * Extra certifications or tools
+      * Domain knowledge (e.g., fintech, e-commerce)
+    * Elaborate each item in the list
+    * If not stated, infer from context
+    * Try to not leave it empty
+
+14. **skillsTag**
+    * List of short, high-level tags summarizing the technical scope
+    * Derived from:
+      * jobTitle
+      * requiredProfile and preferredProfile
+      * industry context
+    * Example: `["Backend", "Cloud", "DevOps"]`
+
+15. **languageRequirements**
+    * Required spoken/written language(s)
+    * If not stated:
+      * Use language of the posting
+      * Infer from job location
+      * If job is in Indonesia, default to `["Bahasa Indonesia"]`
+      * If international, use `["English"]` or both
+
+16. **workArrangement**
+    * One of: `"Remote"`, `"On-site"`, `"Hybrid"`
+    * Infer if missing using clues like job title or phrases like "work from home"
+    * Default to `"On-site"` if not stated
+
+17. **linkedinJobUrl**
+    * The full URL of the job if posted on LinkedIn
+    * If not stated, leave it empty like `""`
+
+18. **benefits**
+    * List of benefits provided by the company, select from the following categories:
+        - `"Supplemental Insurance"`: (vision, dental, mental health, HSA/FSA)
+        - `"Wellness Perks"`: (gym membership, wellness stipends, on-site fitness)
+        - `"Remote Work Support"`: (WFH option, home office allowance, internet stipend)
+        - `"Time Off"`: (unlimited PTO, recharge days, sabbaticals, volunteer days)
+        - `"Financial Incentives"`: (bonuses, profit sharing, stock options/equity grants)
+        - `"Commute & Relocation"`: (commuter allowance, relocation assistance, visa sponsorship)
+        - `"Learning & Development"`: (L&D budget, tuition reimbursement, paid certifications, mentorship)
+        - `"Parental & Family Support"`: (extended leave, fertility/adoption aid, childcare support)
+        - `"Food & Office Perks"`: (free meals/snacks, pet-friendly office, retreats)
+        - `"Equity & Ownership Benefits"`: (stock options, RSUs, employee stock purchase plans) 
+    * If not stated, leave it empty like `[]`
+
+19. **salaryRange**
+    * Salary range offered
+    * Example: `"$X,XXX - $X,XXX per year/month/hour"`
+    * `"not specified"` (if no salary is mentioned)
+    * `"Use the currency of the job posting."`
+    * `"Try to use symbols for the currency."`
+    * `"Always be precise with the number of zeros."`
+
+22. **minimumEducationLevel**
+    * Minimum education level required for the job
+    * Select from the following:
+        - `"No Formal Education Required"`  
+        - `"High School Diploma"`  
+        - `"Associate Degree"`  
+        - `"Bachelor's Degree"`  
+        - `"Master's Degree"`  
+        - `"PhD or Equivalent"`
+    
+23. **url**
+    * Any external job page or application URL
+
+24. **isExternal**
+    * Always set to `false`
+
+---
+
+Make sure your result is in **valid JSON**, with all arrays using proper brackets `[]`, and strings wrapped in quotes.
+
+Input:
+{job_text}
 '''
 
 client = openai.OpenAI(api_key=OPENAI_API_KEY)
@@ -147,12 +221,13 @@ engine = create_engine(DATABASE_URL)
 def call_llm(job_text):
     try:
         client = genai.Client(api_key=GEMINI_API_KEY)
+
+        prompt = JOB_EXTRACTION_PROMPT.format(job_text=job_text)
         
         response = client.models.generate_content(
             model='gemini-2.0-flash',
             contents=[
-                JOB_EXTRACTION_PROMPT,
-                job_text
+                prompt,
             ],
             config={
                 'response_mime_type': 'application/json',
@@ -187,7 +262,20 @@ def populate_enhanced_jobs():
         with engine.connect() as conn:
             # Get jobs that haven't been processed yet
             rows = conn.execute(text("""
-                SELECT jr.* FROM "JobRaw" jr
+                SELECT 
+                    jr.*,
+                    c."organizationName" as company_name,
+                    csd."profilePhoto" as company_logo_url,
+                    c."industries" as company_industry1,
+                    csd."industry" as company_industry2,
+                    csd."location" as company_location,
+                    csd."companySize" as company_size,
+                    csd."about" as company_about
+                FROM "JobRaw" jr
+                LEFT JOIN "Company" c ON jr."companyId" = c."id"
+                LEFT JOIN "CompanyScrapingdog" csd ON c."id" = csd."companyId"
+                LEFT JOIN "EnhancedJobDetail" ejd ON jr."id" = ejd."jobRawId"
+                WHERE ejd."id" IS NULL
             """)).fetchall()
 
             logger.debug(f"Found {len(rows)} jobs to process")
@@ -197,16 +285,15 @@ def populate_enhanced_jobs():
                 job_raw_id = row.id
                 pbar.set_description(f"🔍 Processing {row.jobTitle}")
 
-                text_to_send = "\n".join(filter(None, [
-                    f"Job Title: {row.jobTitle}",
-                    f"Company: {row.companyName}",
-                    f"Location: {row.location}",
-                    f"Work Arrangement: {row.workArrangement}",
-                    f"Contract Type: {row.contractType}",
-                    f"Seniority Level: {row.seniorityLevel}",
-                    f"\nDescription:\n{row.description or ''}"
-                ]))
+                data = row._asdict()
+                data["linkedinJobUrl"] = f"https://www.linkedin.com{data['linkedinJobUrl']}"
 
+                # Convert datetime objects to ISO format strings
+                for key, value in data.items():
+                    if isinstance(value, datetime):
+                        data[key] = value.isoformat()
+                
+                text_to_send = json.dumps(data, indent=2)
                 parsed = call_llm(text_to_send)
                 if not parsed:
                     logger.warning(f"⚠️ Skipped due to LLM error for job: {row.jobTitle}")
@@ -214,79 +301,90 @@ def populate_enhanced_jobs():
 
                 try:
                     # Build fields
-                    skill_text = ", ".join((parsed.get("required_skills") or []) + (parsed.get("preferred_skills") or []) + (parsed.get("skills_tag") or []))
-                    overall_text = " ".join(filter(None, [
-                        parsed.get("job_title"),
-                        parsed.get("location"),
-                        parsed.get("experience_level"),
-                        parsed.get("description"),
-                        "\n".join(parsed.get("responsibilities") or [])
+                    overall_text = "\n".join(filter(None, [
+                        f"Job Title: {parsed['job_title']}",
+                        f"\nDescription:\n{parsed['description'] or ''}",
+                        f"\nResponsibilities:" + "\n- ".join(parsed['responsibilities']) if parsed['responsibilities'] else "",
+                        f"\nRequired Profile:" + "\n- ".join(parsed['required_profile']) if parsed['required_profile'] else "",
+                        f"\nPreferred Profile:" + "\n- ".join(parsed['preferred_profile']) if parsed['preferred_profile'] else "",
                     ]))
-
                     # Generate embeddings
                     embedding = generate_embedding(overall_text)
-                    skills_embedding = generate_embedding(skill_text)
-
+                    
                     # Convert embeddings to JSON
                     embedding_json = json.dumps(embedding) if embedding else None
-                    skills_embedding_json = json.dumps(skills_embedding) if skills_embedding else None
 
                     # Upsert the enhanced job
                     result = conn.execute(text("""
                         INSERT INTO "EnhancedJobDetail" (
-                            "id", "jobTitle", "jobType", "location", "experienceLevel",
-                            "minExperience", "maxExperience", "description",
-                            "responsibilities", "requiredSkills", "preferredSkills", "skillsTag",
-                            "url", "isExternal", "jobRawId",
-                            "embedding", "skills_embedding", "languageRequirements",
-                            "createdAt", "updatedAt"
+                            "id", "jobTitle", "companyName", "companyLogoUrl", "companyIndustries",
+                            "contractType", "location", "experienceLevel", "minExperience", "maxExperience",
+                            "description", "responsibilities", "requiredProfile", "preferredProfile",
+                            "skillsTag", "languageRequirements", "benefits", "salaryRange", "workArrangement",
+                            "linkedinJobUrl", "url", "isExternal", "minimumEducationLevel", "embedding",
+                            "jobRawId", "createdAt", "updatedAt"
                         ) VALUES (
                             COALESCE((SELECT "id" FROM "EnhancedJobDetail" WHERE "jobRawId" = :jobRawId), :id),
-                            :jobTitle, :jobType, :location, :experienceLevel,
-                            :minExperience, :maxExperience, :description,
-                            :responsibilities, :requiredSkills, :preferredSkills, :skillsTag,
-                            :url, :isExternal, :jobRawId,
-                            :embedding, :skills_embedding, :languageRequirements,
+                            :jobTitle, :companyName, :companyLogoUrl, :companyIndustries,
+                            :contractType, :location, :experienceLevel, :minExperience, :maxExperience,
+                            :description, :responsibilities, :requiredProfile, :preferredProfile,
+                            :skillsTag, :languageRequirements, :benefits, :salaryRange, :workArrangement,
+                            :linkedinJobUrl, :url, :isExternal, :minimumEducationLevel, :embedding,
+                            :jobRawId,
                             COALESCE((SELECT "createdAt" FROM "EnhancedJobDetail" WHERE "jobRawId" = :jobRawId), now()),
                             now()
                         )
                         ON CONFLICT ("jobRawId") DO UPDATE SET
                             "jobTitle" = EXCLUDED."jobTitle",
-                            "jobType" = EXCLUDED."jobType",
+                            "companyName" = EXCLUDED."companyName",
+                            "companyLogoUrl" = EXCLUDED."companyLogoUrl",
+                            "companyIndustries" = EXCLUDED."companyIndustries",
+                            "contractType" = EXCLUDED."contractType",
                             "location" = EXCLUDED."location",
                             "experienceLevel" = EXCLUDED."experienceLevel",
                             "minExperience" = EXCLUDED."minExperience",
                             "maxExperience" = EXCLUDED."maxExperience",
                             "description" = EXCLUDED."description",
                             "responsibilities" = EXCLUDED."responsibilities",
-                            "requiredSkills" = EXCLUDED."requiredSkills",
-                            "preferredSkills" = EXCLUDED."preferredSkills",
+                            "requiredProfile" = EXCLUDED."requiredProfile",
+                            "preferredProfile" = EXCLUDED."preferredProfile",
                             "skillsTag" = EXCLUDED."skillsTag",
+                            "languageRequirements" = EXCLUDED."languageRequirements",
+                            "benefits" = EXCLUDED."benefits",
+                            "salaryRange" = EXCLUDED."salaryRange",
+                            "workArrangement" = EXCLUDED."workArrangement",
+                            "linkedinJobUrl" = EXCLUDED."linkedinJobUrl",
                             "url" = EXCLUDED."url",
                             "isExternal" = EXCLUDED."isExternal",
+                            "minimumEducationLevel" = EXCLUDED."minimumEducationLevel",
                             "embedding" = EXCLUDED."embedding",
-                            "skills_embedding" = EXCLUDED."skills_embedding",
-                            "languageRequirements" = EXCLUDED."languageRequirements",
                             "updatedAt" = now()
                     """), {
                         "id": cuid(),
                         "jobTitle": parsed.get("job_title"),
-                        "jobType": parsed.get("job_type"),
+                        "companyName": parsed.get("company_name"),
+                        "companyLogoUrl": parsed.get("company_logo_url"),
+                        "companyIndustries": parsed.get("company_industries") or [],
+                        "contractType": parsed.get("contract_type"),
                         "location": parsed.get("location"),
                         "experienceLevel": parsed.get("experience_level"),
                         "minExperience": parsed.get("min_experience"),
                         "maxExperience": parsed.get("max_experience"),
                         "description": parsed.get("description"),
                         "responsibilities": parsed.get("responsibilities") or [],
-                        "requiredSkills": parsed.get("required_skills") or [],
-                        "preferredSkills": parsed.get("preferred_skills") or [],
+                        "requiredProfile": parsed.get("required_profile") or [],
+                        "preferredProfile": parsed.get("preferred_profile") or [],
                         "skillsTag": parsed.get("skills_tag") or [],
-                        "url": row.linkedinJobUrl,
-                        "isExternal": False,
-                        "jobRawId": job_raw_id,
+                        "languageRequirements": parsed.get("language_requirements") or [],
+                        "benefits": parsed.get("benefits") or [],
+                        "salaryRange": parsed.get("salary_range"),
+                        "workArrangement": parsed.get("work_arrangement"),
+                        "linkedinJobUrl": parsed.get("linkedin_job_url"),
+                        "url": parsed.get("url"),
+                        "isExternal": parsed.get("is_external", False),
+                        "minimumEducationLevel": parsed.get("minimum_education_level"),
                         "embedding": embedding_json,
-                        "skills_embedding": skills_embedding_json,
-                        "languageRequirements": parsed.get("language_requirements") or []
+                        "jobRawId": job_raw_id
                     })
 
                     # Commit the transaction
@@ -294,7 +392,9 @@ def populate_enhanced_jobs():
 
                     # Verify the inserted data
                     inserted_data = conn.execute(text("""
-                        SELECT "id", "jobTitle", "jobType", "location", "createdAt"
+                        SELECT 
+                            "id", "jobTitle", "companyName", "location", 
+                            "experienceLevel", "contractType", "createdAt"
                         FROM "EnhancedJobDetail"
                         WHERE "jobRawId" = :job_raw_id
                     """), {"job_raw_id": job_raw_id}).fetchone()
@@ -304,9 +404,9 @@ def populate_enhanced_jobs():
                         total_count = conn.execute(text("""
                             SELECT COUNT(*) FROM "EnhancedJobDetail"
                         """)).scalar()
-                        pbar.set_description(f"✅ Enhanced: {parsed.get('job_title')} - {total_count} records")
+                        pbar.set_description(f"✅ Enhanced: {parsed['job_title']} - {total_count} records")
                     else:
-                        logger.warning(f"⚠️ Could not find inserted data for job: {parsed.get('job_title')}")
+                        logger.warning(f"⚠️ Could not find inserted data for job: {parsed['job_title']}")
 
                 except Exception as e:
                     conn.rollback()
