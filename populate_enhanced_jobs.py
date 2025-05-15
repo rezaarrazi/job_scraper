@@ -12,6 +12,7 @@ import logging
 from dotenv import load_dotenv
 from tqdm import tqdm
 from datetime import datetime
+from rapidfuzz import process, fuzz
 
 load_dotenv()
 
@@ -26,6 +27,7 @@ logger = setup_logger(__name__, level=logging.DEBUG)
 # --- Schema Definition ---
 class JobExtraction(BaseModel):
     job_title: str
+    simplified_job_title: str
     company_name: str
     company_logo_url: str
     company_industries: List[str]
@@ -60,22 +62,32 @@ Given a full job description, extract and format the following fields clearly an
    * Always translate to English
    * Example: `"Senior Software Engineer"`
 
-2. **companyName**
+2. **simplifiedJobTitle**
+    * Translate the job title to English.
+    * Format in **Title Case** (e.g., "Product Manager"), but keep known abbreviations (e.g., CTO, CRM) in **UPPERCASE**.
+    * Remove any mention of:
+        - Seniority (e.g., "Senior", "Junior")
+        - Gender
+        - Age
+        - Location
+        - Contract type or employment terms (e.g., "Freelance", "Part-time", "Work-study")
+
+3. **companyName**
    * The company offering the job
    * Use the name mentioned in the job description or job metadata
    * Example: `"Tokopedia"`
 
-3. **companyLogoUrl**
+4. **companyLogoUrl**
    * The URL of the company logo
    * If not stated, leave it empty like `""`
 
-4. **companyIndustries**
+5. **companyIndustries**
    * List of industries the company is in, use the industry mentioned in the job description or job metadata
    * The industry should be specific, not general. For example, "Technology" is not a specific industry, but "E-commerce" or "Fintech" is. And don't write short form of the industry, for example, "Tech", "AI" is not a specific industry, but "Information Technology" or "Artificial Intelligence" is.
    * If not stated, infer from job description, default to `["Other"]`
    * Example: `["E-commerce", "Fintech"]`
 
-5. **contractType**
+6. **contractType**
    * Strictly select from the following list:
         - `"Full-Time"` : for full-time or permanent positions
         - `"Part-Time"` : for part-time positions
@@ -85,11 +97,11 @@ Given a full job description, extract and format the following fields clearly an
         - `"Other"` : for other contract types
    * If not stated, infer based on context, default to `"Full-time"`
 
-6. **location**
+7. **location**
    * Format: `"City, State/Province, Country"`
    * If missing, infer from job or company context
 
-7. **experienceLevel**
+8. **experienceLevel**
    * Reformulate the experience level from the job title and description, select from the following:
         - `"Entry-Level"`
         - `"Mid-Level"`  
@@ -99,7 +111,7 @@ Given a full job description, extract and format the following fields clearly an
         - `"Executive"`
    * If not stated, infer from title and description, default to `"Entry-Level"`
 
-8. **minExperience**
+9. **minExperience**
    * Integer: minimum required years of experience
    * If not stated, infer:
      * Entry: 0-2
@@ -107,21 +119,21 @@ Given a full job description, extract and format the following fields clearly an
      * Senior: 5-10
      * Lead+: 8-15
 
-9. **maxExperience**
-   * Integer: maximum years of experience
-   * Leave it empty if not stated
+10. **maxExperience**
+    * Integer: maximum years of experience
+    * Leave it empty if not stated
 
-10. **description**
+11. **description**
     * A detailed description of the job role, including its purpose, scope, and expectations.
     * Translate to English if needed
     * Highlight role purpose and expectations
 
-11. **responsibilities**
+12. **responsibilities**
     * A structured list outlining the key duties and responsibilities associated with this role.
     * Use action-oriented statements
     * If not explicitly listed, extract from job body
 
-12. **requiredProfile**
+13. **requiredProfile**
     * List of essential qualifications or skills
     * Can include:
       * Technical skills (e.g., Java, SQL)
@@ -132,7 +144,7 @@ Given a full job description, extract and format the following fields clearly an
     * If not listed, infer based on job description, responsibilities and role type
     * Try to not leave it empty
 
-13. **preferredProfile**
+14. **preferredProfile**
     * A list of additional, nice-to-have skills that would be beneficial but are not mandatory. 
     * Includes:
       * Advanced degrees
@@ -142,7 +154,7 @@ Given a full job description, extract and format the following fields clearly an
     * If not stated, infer from context
     * Try to not leave it empty
 
-14. **skillsTag**
+15. **skillsTag**
     * List of short, high-level tags summarizing the technical scope
     * Derived from:
       * jobTitle
@@ -150,7 +162,7 @@ Given a full job description, extract and format the following fields clearly an
       * industry context
     * Example: `["Backend", "Cloud", "DevOps"]`
 
-15. **languageRequirements**
+16. **languageRequirements**
     * Required spoken/written language(s)
     * If not stated:
       * Use language of the posting
@@ -158,16 +170,16 @@ Given a full job description, extract and format the following fields clearly an
       * If job is in Indonesia, default to `["Bahasa Indonesia"]`
       * If international, use `["English"]` or both
 
-16. **workArrangement**
+17. **workArrangement**
     * One of: `"Remote"`, `"On-site"`, `"Hybrid"`
     * Infer if missing using clues like job title or phrases like "work from home"
     * Default to `"On-site"` if not stated
 
-17. **linkedinJobUrl**
+18. **linkedinJobUrl**
     * The full URL of the job if posted on LinkedIn
     * If not stated, leave it empty like `""`
 
-18. **benefits**
+19. **benefits**
     * List of benefits provided by the company, select from the following categories:
         - `"Supplemental Insurance"`: (vision, dental, mental health, HSA/FSA)
         - `"Wellness Perks"`: (gym membership, wellness stipends, on-site fitness)
@@ -181,7 +193,7 @@ Given a full job description, extract and format the following fields clearly an
         - `"Equity & Ownership Benefits"`: (stock options, RSUs, employee stock purchase plans) 
     * If not stated, leave it empty like `[]`
 
-19. **salaryRange**
+20. **salaryRange**
     * Salary range offered
     * Example: `"$X,XXX - $X,XXX per year/month/hour"`
     * `"not specified"` (if no salary is mentioned)
@@ -189,7 +201,7 @@ Given a full job description, extract and format the following fields clearly an
     * `"Try to use symbols for the currency."`
     * `"Always be precise with the number of zeros."`
 
-22. **minimumEducationLevel**
+21. **minimumEducationLevel**
     * Minimum education level required for the job
     * Select from the following:
         - `"No Formal Education Required"`  
@@ -199,10 +211,10 @@ Given a full job description, extract and format the following fields clearly an
         - `"Master's Degree"`  
         - `"PhD or Equivalent"`
     
-23. **url**
+22. **url**
     * Any external job page or application URL
 
-24. **isExternal**
+23. **isExternal**
     * Always set to `false`
 
 ---
@@ -258,6 +270,18 @@ def generate_embedding(text: str):
 
 # --- Main Logic ---
 def populate_enhanced_jobs():
+    industries = pd.read_csv(os.path.join(os.getcwd(), 'data/output/industries/unique_industries.csv'))['industry'].tolist()
+    # Load job titles from JSON
+    job_categories_path = os.path.join(os.getcwd(), './data/output/job_category/jobright_job_categories.json')
+    with open(job_categories_path, 'r') as f:
+        job_categories = json.load(f)
+    
+    # Extract all job titles into a flat list
+    job_titles = []
+    for category in job_categories.values():
+        for subcategory in category.values():
+            job_titles.extend(subcategory)
+
     try:
         with engine.connect() as conn:
             # Get jobs that haven't been processed yet
@@ -298,6 +322,33 @@ def populate_enhanced_jobs():
                 if not parsed:
                     logger.warning(f"⚠️ Skipped due to LLM error for job: {row.jobTitle}")
                     continue
+
+                industries = []
+                for industry in parsed['companyIndustries']:
+                    match, score, _ = process.extractOne(industry, industries, scorer=fuzz.token_set_ratio)
+                    if match and score > 70:
+                        industries.append(match)
+                    else:
+                        industries.append(industry)
+                parsed['companyIndustries'] = industries
+
+                contract_type_candidates = ["Full-Time", "Part-Time", "Contract", "Freelance", "Internship"]
+                contract_type_match, contract_type_score, _ = process.extractOne(parsed['contractType'], contract_type_candidates, scorer=fuzz.token_set_ratio)
+                if contract_type_match and contract_type_score > 70:
+                    parsed['contractType'] = contract_type_match
+                else:
+                    parsed['contractType'] = "Other"
+
+                experience_level_candidates = ["Entry-Level", "Mid-Level", "Senior-Level", "Lead", "Director", "Executive"]
+                experience_level_match, experience_level_score, _ = process.extractOne(parsed['experienceLevel'], experience_level_candidates, scorer=fuzz.token_set_ratio)
+                if experience_level_match and experience_level_score > 70:
+                    parsed['experienceLevel'] = experience_level_match
+                else:
+                    parsed['experienceLevel'] = "Entry-Level"
+                
+                match_job_title, score_job_title, _ = process.extractOne(parsed["simplifiedJobTitle"], job_titles, scorer=fuzz.token_set_ratio)
+                if match_job_title and score_job_title > 70:
+                    parsed['simplifiedJobTitle'] = match_job_title
 
                 try:
                     # Build fields
