@@ -6,13 +6,15 @@ from sqlalchemy import create_engine, text
 from cuid import cuid
 import json
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from utils.logger import setup_logger
 import logging
 from dotenv import load_dotenv
 from tqdm import tqdm
 from datetime import datetime
 from rapidfuzz import process, fuzz
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
 
 load_dotenv()
 
@@ -28,6 +30,7 @@ logger = setup_logger(__name__, level=logging.DEBUG)
 class JobExtraction(BaseModel):
     job_title: str
     simplified_job_title: str
+    simplified_job_title_standardized: str
     company_name: str
     company_logo_url: str
     company_industries: List[str]
@@ -57,9 +60,10 @@ Given a full job description, extract and format the following fields clearly an
 ### Field Guidelines:
 
 1. **jobTitle**
-   * The official title of the position
+   * The official title of the position in correct and clean formatting
    * Should be specific and match the company's terminology
    * Always translate to English
+   * If not stated, try to infer from the job description
    * Example: `"Senior Software Engineer"`
 
 2. **simplifiedJobTitle**
@@ -268,7 +272,76 @@ def generate_embedding(text: str):
         print(f"❌ Embedding error: {e}")
         return None
 
-# --- Main Logic ---
+def process_job_worker(row: Any, industries_candidates: List[str], job_titles: List[str], engine) -> Dict[str, Any]:
+    """Worker function to process a single job"""
+    try:
+        job_raw_id = row.id
+        data = row._asdict()
+        data["linkedinJobUrl"] = f"https://www.linkedin.com{data['linkedinJobUrl']}"
+
+        # Convert datetime objects to ISO format strings
+        for key, value in data.items():
+            if isinstance(value, datetime):
+                data[key] = value.isoformat()
+        
+        text_to_send = json.dumps(data, indent=2)
+        parsed = call_llm(text_to_send)
+        if not parsed:
+            logger.warning(f"⚠️ Skipped due to LLM error for job: {row.jobTitle}")
+            return None
+
+        # Process industries
+        industries = []
+        for industry in parsed['company_industries']:
+            match, score, _ = process.extractOne(industry, industries_candidates, scorer=fuzz.token_set_ratio)
+            if match and score > 80:
+                industries.append(match)
+            else:
+                industries.append(industry)
+        parsed['company_industries'] = industries
+
+        # Process contract type
+        contract_type_candidates = ["Full-Time", "Part-Time", "Contract", "Freelance", "Internship"]
+        contract_type_match, contract_type_score, _ = process.extractOne(parsed['contract_type'], contract_type_candidates, scorer=fuzz.token_set_ratio)
+        if contract_type_match and contract_type_score > 80:
+            parsed['contract_type'] = contract_type_match
+        else:
+            parsed['contract_type'] = "Other"
+
+        # Process experience level
+        experience_level_candidates = ["Entry-Level", "Mid-Level", "Senior-Level", "Lead", "Director", "Executive"]
+        experience_level_match, experience_level_score, _ = process.extractOne(parsed['experience_level'], experience_level_candidates, scorer=fuzz.token_set_ratio)
+        if experience_level_match and experience_level_score > 80:
+            parsed['experience_level'] = experience_level_match
+        else:
+            parsed['experience_level'] = "Entry-Level"
+        
+        # Process job title
+        match_job_title, score_job_title, _ = process.extractOne(parsed["simplified_job_title"], job_titles, scorer=fuzz.token_set_ratio)
+        if match_job_title and score_job_title > 80:
+            parsed['simplified_job_title_standardized'] = match_job_title
+
+        # Generate embeddings
+        overall_text = "\n".join(filter(None, [
+            f"Job Title: {parsed['job_title']}",
+            f"\nDescription:\n{parsed['description'] or ''}",
+            f"\nResponsibilities:" + "\n- ".join(parsed['responsibilities']) if parsed['responsibilities'] else "",
+            f"\nRequired Profile:" + "\n- ".join(parsed['required_profile']) if parsed['required_profile'] else "",
+            f"\nPreferred Profile:" + "\n- ".join(parsed['preferred_profile']) if parsed['preferred_profile'] else "",
+        ]))
+        embedding = generate_embedding(overall_text)
+        embedding_json = json.dumps(embedding) if embedding else None
+
+        return {
+            "job_raw_id": job_raw_id,
+            "data": data,
+            "parsed": parsed,
+            "embedding_json": embedding_json
+        }
+    except Exception as e:
+        logger.error(f"❌ Error processing job {row.jobTitle}: {str(e)}")
+        return None
+
 def populate_enhanced_jobs():
     industries_candidates = pd.read_csv(os.path.join(os.getcwd(), 'data/output/industries/unique_industries.csv'))['industry'].tolist()
     # Load job titles from JSON
@@ -304,169 +377,128 @@ def populate_enhanced_jobs():
 
             logger.debug(f"Found {len(rows)} jobs to process")
 
-            pbar = tqdm(rows, desc="Processing jobs")
-            for row in pbar:
-                job_raw_id = row.id
-                pbar.set_description(f"🔍 Processing {row.jobTitle}")
+            # Process jobs concurrently
+            max_workers = 10
+            successful_jobs = 0
+            failed_jobs = 0
 
-                data = row._asdict()
-                data["linkedinJobUrl"] = f"https://www.linkedin.com{data['linkedinJobUrl']}"
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # Submit all jobs to the executor
+                futures = {
+                    executor.submit(
+                        process_job_worker,
+                        row,
+                        industries_candidates,
+                        job_titles,
+                        engine
+                    ): row for row in rows
+                }
 
-                # Convert datetime objects to ISO format strings
-                for key, value in data.items():
-                    if isinstance(value, datetime):
-                        data[key] = value.isoformat()
-                
-                text_to_send = json.dumps(data, indent=2)
-                parsed = call_llm(text_to_send)
-                if not parsed:
-                    logger.warning(f"⚠️ Skipped due to LLM error for job: {row.jobTitle}")
-                    continue
+                # Create progress bar
+                with tqdm(total=len(rows), desc="Processing jobs", unit="job") as pbar:
+                    for future in as_completed(futures):
+                        row = futures[future]
+                        try:
+                            result = future.result()
+                            if result:
+                                # Insert the processed job into the database
+                                try:
+                                    conn.execute(text("""
+                                        INSERT INTO "EnhancedJobDetail" (
+                                            "id", "companyId", "jobTitle", "simplifiedJobTitle", "simplifiedJobTitleStandardized", "companyName", "companyLogoUrl", "companyIndustries",
+                                            "contractType", "location", "experienceLevel", "minExperience", "maxExperience",
+                                            "description", "responsibilities", "requiredProfile", "preferredProfile",
+                                            "skillsTag", "languageRequirements", "benefits", "salaryRange", "workArrangement",
+                                            "linkedinJobUrl", "url", "isExternal", "minimumEducationLevel", "embedding",
+                                            "jobRawId", "createdAt", "updatedAt"
+                                        ) VALUES (
+                                            COALESCE((SELECT "id" FROM "EnhancedJobDetail" WHERE "jobRawId" = :jobRawId), :id),
+                                            :companyId, :jobTitle, :simplifiedJobTitle, :simplifiedJobTitleStandardized, :companyName, :companyLogoUrl, :companyIndustries,
+                                            :contractType, :location, :experienceLevel, :minExperience, :maxExperience,
+                                            :description, :responsibilities, :requiredProfile, :preferredProfile,
+                                            :skillsTag, :languageRequirements, :benefits, :salaryRange, :workArrangement,
+                                            :linkedinJobUrl, :url, :isExternal, :minimumEducationLevel, :embedding,
+                                            :jobRawId,
+                                            COALESCE((SELECT "createdAt" FROM "EnhancedJobDetail" WHERE "jobRawId" = :jobRawId), now()),
+                                            now()
+                                        )
+                                        ON CONFLICT ("jobRawId") DO UPDATE SET
+                                            "companyId" = EXCLUDED."companyId",
+                                            "jobTitle" = EXCLUDED."jobTitle",
+                                            "simplifiedJobTitle" = EXCLUDED."simplifiedJobTitle",
+                                            "simplifiedJobTitleStandardized" = EXCLUDED."simplifiedJobTitleStandardized",
+                                            "companyName" = EXCLUDED."companyName",
+                                            "companyLogoUrl" = EXCLUDED."companyLogoUrl",
+                                            "companyIndustries" = EXCLUDED."companyIndustries",
+                                            "contractType" = EXCLUDED."contractType",
+                                            "location" = EXCLUDED."location",
+                                            "experienceLevel" = EXCLUDED."experienceLevel",
+                                            "minExperience" = EXCLUDED."minExperience",
+                                            "maxExperience" = EXCLUDED."maxExperience",
+                                            "description" = EXCLUDED."description",
+                                            "responsibilities" = EXCLUDED."responsibilities",
+                                            "requiredProfile" = EXCLUDED."requiredProfile",
+                                            "preferredProfile" = EXCLUDED."preferredProfile",
+                                            "skillsTag" = EXCLUDED."skillsTag",
+                                            "languageRequirements" = EXCLUDED."languageRequirements",
+                                            "benefits" = EXCLUDED."benefits",
+                                            "salaryRange" = EXCLUDED."salaryRange",
+                                            "workArrangement" = EXCLUDED."workArrangement",
+                                            "linkedinJobUrl" = EXCLUDED."linkedinJobUrl",
+                                            "url" = EXCLUDED."url",
+                                            "isExternal" = EXCLUDED."isExternal",
+                                            "minimumEducationLevel" = EXCLUDED."minimumEducationLevel",
+                                            "embedding" = EXCLUDED."embedding",
+                                            "updatedAt" = now()
+                                    """), {
+                                        "id": cuid(),
+                                        "companyId": result["data"]["companyId"],
+                                        "jobTitle": result["parsed"].get("job_title"),
+                                        "simplifiedJobTitle": result["parsed"].get("simplified_job_title"),
+                                        "simplifiedJobTitleStandardized": result["parsed"].get("simplified_job_title_standardized"),
+                                        "companyName": result["parsed"].get("company_name"),
+                                        "companyLogoUrl": result["data"]["company_logo_url"],
+                                        "companyIndustries": result["parsed"].get("company_industries") or [],
+                                        "contractType": result["parsed"].get("contract_type"),
+                                        "location": result["parsed"].get("location"),
+                                        "experienceLevel": result["parsed"].get("experience_level"),
+                                        "minExperience": result["parsed"].get("min_experience"),
+                                        "maxExperience": result["parsed"].get("max_experience"),
+                                        "description": result["parsed"].get("description"),
+                                        "responsibilities": result["parsed"].get("responsibilities") or [],
+                                        "requiredProfile": result["parsed"].get("required_profile") or [],
+                                        "preferredProfile": result["parsed"].get("preferred_profile") or [],
+                                        "skillsTag": result["parsed"].get("skills_tag") or [],
+                                        "languageRequirements": result["parsed"].get("language_requirements") or [],
+                                        "benefits": result["parsed"].get("benefits") or [],
+                                        "salaryRange": result["parsed"].get("salary_range"),
+                                        "workArrangement": result["parsed"].get("work_arrangement"),
+                                        "linkedinJobUrl": result["parsed"].get("linkedin_job_url"),
+                                        "url": result["parsed"].get("url"),
+                                        "isExternal": False,
+                                        "minimumEducationLevel": result["parsed"].get("minimum_education_level"),
+                                        "embedding": result["embedding_json"],
+                                        "jobRawId": result["job_raw_id"]
+                                    })
+                                    conn.commit()
+                                    successful_jobs += 1
+                                except Exception as e:
+                                    conn.rollback()
+                                    logger.error(f"❌ Error inserting job {result['parsed'].get('job_title')}: {str(e)}")
+                                    failed_jobs += 1
+                            else:
+                                failed_jobs += 1
+                        except Exception as e:
+                            logger.error(f"❌ Error processing job {row.jobTitle}: {str(e)}")
+                            failed_jobs += 1
+                        finally:
+                            pbar.update(1)
+                            pbar.set_postfix(
+                                successful=successful_jobs,
+                                failed=failed_jobs
+                            )
 
-                industries = []
-                for industry in parsed['company_industries']:
-                    match, score, _ = process.extractOne(industry, industries_candidates, scorer=fuzz.token_set_ratio)
-                    if match and score > 80:
-                        industries.append(match)
-                    else:
-                        industries.append(industry)
-                parsed['company_industries'] = industries
-
-                contract_type_candidates = ["Full-Time", "Part-Time", "Contract", "Freelance", "Internship"]
-                contract_type_match, contract_type_score, _ = process.extractOne(parsed['contract_type'], contract_type_candidates, scorer=fuzz.token_set_ratio)
-                if contract_type_match and contract_type_score > 80:
-                    parsed['contract_type'] = contract_type_match
-                else:
-                    parsed['contract_type'] = "Other"
-
-                experience_level_candidates = ["Entry-Level", "Mid-Level", "Senior-Level", "Lead", "Director", "Executive"]
-                experience_level_match, experience_level_score, _ = process.extractOne(parsed['experience_level'], experience_level_candidates, scorer=fuzz.token_set_ratio)
-                if experience_level_match and experience_level_score > 80:
-                    parsed['experience_level'] = experience_level_match
-                else:
-                    parsed['experience_level'] = "Entry-Level"
-                
-                match_job_title, score_job_title, _ = process.extractOne(parsed["simplified_job_title"], job_titles, scorer=fuzz.token_set_ratio)
-                if match_job_title and score_job_title > 80:
-                    parsed['simplified_job_title'] = match_job_title
-
-                try:
-                    # Build fields
-                    overall_text = "\n".join(filter(None, [
-                        f"Job Title: {parsed['job_title']}",
-                        f"\nDescription:\n{parsed['description'] or ''}",
-                        f"\nResponsibilities:" + "\n- ".join(parsed['responsibilities']) if parsed['responsibilities'] else "",
-                        f"\nRequired Profile:" + "\n- ".join(parsed['required_profile']) if parsed['required_profile'] else "",
-                        f"\nPreferred Profile:" + "\n- ".join(parsed['preferred_profile']) if parsed['preferred_profile'] else "",
-                    ]))
-                    # Generate embeddings
-                    embedding = generate_embedding(overall_text)
-                    
-                    # Convert embeddings to JSON
-                    embedding_json = json.dumps(embedding) if embedding else None
-
-                    # Upsert the enhanced job
-                    result = conn.execute(text("""
-                        INSERT INTO "EnhancedJobDetail" (
-                            "id", "companyId", "jobTitle", "simplifiedJobTitle", "companyName", "companyLogoUrl", "companyIndustries",
-                            "contractType", "location", "experienceLevel", "minExperience", "maxExperience",
-                            "description", "responsibilities", "requiredProfile", "preferredProfile",
-                            "skillsTag", "languageRequirements", "benefits", "salaryRange", "workArrangement",
-                            "linkedinJobUrl", "url", "isExternal", "minimumEducationLevel", "embedding",
-                            "jobRawId", "createdAt", "updatedAt"
-                        ) VALUES (
-                            COALESCE((SELECT "id" FROM "EnhancedJobDetail" WHERE "jobRawId" = :jobRawId), :id),
-                            :companyId, :jobTitle, :simplifiedJobTitle, :companyName, :companyLogoUrl, :companyIndustries,
-                            :contractType, :location, :experienceLevel, :minExperience, :maxExperience,
-                            :description, :responsibilities, :requiredProfile, :preferredProfile,
-                            :skillsTag, :languageRequirements, :benefits, :salaryRange, :workArrangement,
-                            :linkedinJobUrl, :url, :isExternal, :minimumEducationLevel, :embedding,
-                            :jobRawId,
-                            COALESCE((SELECT "createdAt" FROM "EnhancedJobDetail" WHERE "jobRawId" = :jobRawId), now()),
-                            now()
-                        )
-                        ON CONFLICT ("jobRawId") DO UPDATE SET
-                            "companyId" = EXCLUDED."companyId",
-                            "jobTitle" = EXCLUDED."jobTitle",
-                            "simplifiedJobTitle" = EXCLUDED."simplifiedJobTitle",
-                            "companyName" = EXCLUDED."companyName",
-                            "companyLogoUrl" = EXCLUDED."companyLogoUrl",
-                            "companyIndustries" = EXCLUDED."companyIndustries",
-                            "contractType" = EXCLUDED."contractType",
-                            "location" = EXCLUDED."location",
-                            "experienceLevel" = EXCLUDED."experienceLevel",
-                            "minExperience" = EXCLUDED."minExperience",
-                            "maxExperience" = EXCLUDED."maxExperience",
-                            "description" = EXCLUDED."description",
-                            "responsibilities" = EXCLUDED."responsibilities",
-                            "requiredProfile" = EXCLUDED."requiredProfile",
-                            "preferredProfile" = EXCLUDED."preferredProfile",
-                            "skillsTag" = EXCLUDED."skillsTag",
-                            "languageRequirements" = EXCLUDED."languageRequirements",
-                            "benefits" = EXCLUDED."benefits",
-                            "salaryRange" = EXCLUDED."salaryRange",
-                            "workArrangement" = EXCLUDED."workArrangement",
-                            "linkedinJobUrl" = EXCLUDED."linkedinJobUrl",
-                            "url" = EXCLUDED."url",
-                            "isExternal" = EXCLUDED."isExternal",
-                            "minimumEducationLevel" = EXCLUDED."minimumEducationLevel",
-                            "embedding" = EXCLUDED."embedding",
-                            "updatedAt" = now()
-                    """), {
-                        "id": cuid(),
-                        "companyId": data["companyId"],
-                        "jobTitle": parsed.get("job_title"),
-                        "simplifiedJobTitle": parsed.get("simplified_job_title"),
-                        "companyName": parsed.get("company_name"),
-                        "companyLogoUrl": data["company_logo_url"],
-                        "companyIndustries": parsed.get("company_industries") or [],
-                        "contractType": parsed.get("contract_type"),
-                        "location": parsed.get("location"),
-                        "experienceLevel": parsed.get("experience_level"),
-                        "minExperience": parsed.get("min_experience"),
-                        "maxExperience": parsed.get("max_experience"),
-                        "description": parsed.get("description"),
-                        "responsibilities": parsed.get("responsibilities") or [],
-                        "requiredProfile": parsed.get("required_profile") or [],
-                        "preferredProfile": parsed.get("preferred_profile") or [],
-                        "skillsTag": parsed.get("skills_tag") or [],
-                        "languageRequirements": parsed.get("language_requirements") or [],
-                        "benefits": parsed.get("benefits") or [],
-                        "salaryRange": parsed.get("salary_range"),
-                        "workArrangement": parsed.get("work_arrangement"),
-                        "linkedinJobUrl": parsed.get("linkedin_job_url"),
-                        "url": parsed.get("url"),
-                        "isExternal": parsed.get("is_external", False),
-                        "minimumEducationLevel": parsed.get("minimum_education_level"),
-                        "embedding": embedding_json,
-                        "jobRawId": job_raw_id
-                    })
-
-                    # Commit the transaction
-                    conn.commit()
-
-                    # Verify the inserted data
-                    inserted_data = conn.execute(text("""
-                        SELECT 
-                            "id", "jobTitle", "simplifiedJobTitle", "companyName", "location", 
-                            "experienceLevel", "contractType", "createdAt"
-                        FROM "EnhancedJobDetail"
-                        WHERE "jobRawId" = :job_raw_id
-                    """), {"job_raw_id": job_raw_id}).fetchone()
-                    
-                    if inserted_data:
-                        # Also check the total count
-                        total_count = conn.execute(text("""
-                            SELECT COUNT(*) FROM "EnhancedJobDetail"
-                        """)).scalar()
-                        pbar.set_description(f"✅ Enhanced: {parsed['job_title']} - {total_count} records")
-                    else:
-                        logger.warning(f"⚠️ Could not find inserted data for job: {parsed['job_title']}")
-
-                except Exception as e:
-                    conn.rollback()
-                    logger.error(f"❌ Error inserting job {parsed.get('job_title')}: {str(e)}")
-                    continue
+            logger.info(f"✅ Processing complete. Successful: {successful_jobs}, Failed: {failed_jobs}")
 
     except Exception as e:
         logger.error(f"❌ Fatal error: {str(e)}")
