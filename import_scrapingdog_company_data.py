@@ -18,6 +18,37 @@ SCRAPINGDOG_URL = "https://api.scrapingdog.com/linkedin"
 logger = setup_logger(__name__)
 engine = create_engine(DATABASE_URL)
 
+# Mapping from CSV columns to JSON keys used by the ScrapingDog API
+CSV_TO_JSON_MAPPING = {
+    'id': 'id',  # This should typically be generated with cuid()
+    'companyName': 'company_name',
+    'universalNameId': 'universal_name_id',
+    'profilePhoto': 'profile_photo',
+    'backgroundCoverImage': 'background_cover_image_url',
+    'industry': 'industry',
+    'industries': 'industries',
+    'type': 'type',
+    'tagline': 'tagline',
+    'location': 'location',
+    'companySize': 'company_size',
+    'companySizeLinkedIn': 'company_size_on_linkedin',
+    'followerCount': 'follower_count',
+    'website': 'website',
+    'founded': 'founded',
+    'headquarters': 'headquarters',
+    'about': 'about',
+    'specialties': 'specialties',
+    'linkedinInternalId': 'linkedin_internal_id',
+    'locations': 'locations',
+    'employees': 'employees',
+    'updates': 'updates',
+    'similarCompanies': 'similar_companies',
+    'affiliatedCompanies': 'affiliated_companies',
+    'products': 'product',
+    'companyId': 'companyId',
+    'description': 'description',
+}
+
 def get_scrapingdog_data(linkedinId):
     params = {
         "api_key": SCRAPINGDOG_API_KEY,
@@ -77,11 +108,13 @@ def import_scrapingdog_data(data_source="api", csv_path=None):
                 for _, row in pbar:
                     name = row.get('companyName', '')
                     pbar.set_description(f"📄 {name}")
+
+                    linkedin = "https://www.linkedin.com/company/" + row.get('universalNameId', '')
                     
                     # Find company by organization name
                     company_result = conn.execute(text("""
-                        SELECT id FROM "Company" WHERE "organizationName" = :name
-                    """), {"name": name}).fetchone()
+                        SELECT id FROM "Company" WHERE "linkedin" LIKE '%' || :linkedin || '%'
+                    """), {"linkedin": linkedin}).fetchone()
                     
                     if not company_result:
                         logger.warning(f"⚠️ Skipping {name}, organization name not found in database")
@@ -98,8 +131,17 @@ def import_scrapingdog_data(data_source="api", csv_path=None):
                         logger.warning(f"⚠️ Skipping {name}, data already exists")
                         continue
                     
-                    # Convert row to dict for processing
-                    data = row.to_dict()
+                    # Convert row to dict and map CSV columns to expected JSON structure
+                    row_dict = row.to_dict()
+                    data = {}
+                    
+                    # Map CSV columns to the expected JSON keys
+                    for csv_col, json_key in CSV_TO_JSON_MAPPING.items():
+                        if csv_col in row_dict:
+                            data[json_key] = row_dict[csv_col]
+                    
+                    data['linkedinUrl'] = linkedin
+                    
                     insert_company_data(conn, company_id, data, name)
             except Exception as e:
                 logger.error(f"❌ Failed to process CSV file: {str(e)}")

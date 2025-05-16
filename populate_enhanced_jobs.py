@@ -67,9 +67,8 @@ Given a full job description, extract and format the following fields clearly an
     * Format in **Title Case** (e.g., "Product Manager"), but keep known abbreviations (e.g., CTO, CRM) in **UPPERCASE**.
     * Remove any mention of:
         - Seniority (e.g., "Senior", "Junior")
-        - Gender
-        - Age
-        - Location
+        - Gender (e.g., "m/w/d")
+        - Location (e.g., "Jakarta", "Surabaya")
         - Contract type or employment terms (e.g., "Freelance", "Part-time", "Work-study")
 
 3. **companyName**
@@ -121,6 +120,7 @@ Given a full job description, extract and format the following fields clearly an
 
 10. **maxExperience**
     * Integer: maximum years of experience
+    * Should be higher or equal to minExperience
     * Leave it empty if not stated
 
 11. **description**
@@ -155,12 +155,12 @@ Given a full job description, extract and format the following fields clearly an
     * Try to not leave it empty
 
 15. **skillsTag**
-    * List of short, high-level tags summarizing the technical scope
+    * List of short, high-level tags summarizing the technical scope/skills and tech stacks/tools used in the job
     * Derived from:
       * jobTitle
       * requiredProfile and preferredProfile
       * industry context
-    * Example: `["Backend", "Cloud", "DevOps"]`
+    * Example: `["Backend", "Cloud", "DevOps", "React", "Node.js", "Python", "Docker", "Kubernetes", "AWS", "CI/CD", "Git", "SQL", "NoSQL", "PostgreSQL", "MySQL", "MongoDB", "Redis", "Elasticsearch", "Kafka", "RabbitMQ", "Docker", "Kubernetes", "AWS", "CI/CD", "Git", "SQL", "NoSQL", "PostgreSQL", "MySQL", "MongoDB", "Redis", "Elasticsearch", "Kafka", "RabbitMQ"]`
 
 16. **languageRequirements**
     * Required spoken/written language(s)
@@ -270,7 +270,7 @@ def generate_embedding(text: str):
 
 # --- Main Logic ---
 def populate_enhanced_jobs():
-    industries = pd.read_csv(os.path.join(os.getcwd(), 'data/output/industries/unique_industries.csv'))['industry'].tolist()
+    industries_candidates = pd.read_csv(os.path.join(os.getcwd(), 'data/output/industries/unique_industries.csv'))['industry'].tolist()
     # Load job titles from JSON
     job_categories_path = os.path.join(os.getcwd(), './data/output/job_category/jobright_job_categories.json')
     with open(job_categories_path, 'r') as f:
@@ -324,31 +324,31 @@ def populate_enhanced_jobs():
                     continue
 
                 industries = []
-                for industry in parsed['companyIndustries']:
-                    match, score, _ = process.extractOne(industry, industries, scorer=fuzz.token_set_ratio)
-                    if match and score > 70:
+                for industry in parsed['company_industries']:
+                    match, score, _ = process.extractOne(industry, industries_candidates, scorer=fuzz.token_set_ratio)
+                    if match and score > 80:
                         industries.append(match)
                     else:
                         industries.append(industry)
-                parsed['companyIndustries'] = industries
+                parsed['company_industries'] = industries
 
                 contract_type_candidates = ["Full-Time", "Part-Time", "Contract", "Freelance", "Internship"]
-                contract_type_match, contract_type_score, _ = process.extractOne(parsed['contractType'], contract_type_candidates, scorer=fuzz.token_set_ratio)
-                if contract_type_match and contract_type_score > 70:
-                    parsed['contractType'] = contract_type_match
+                contract_type_match, contract_type_score, _ = process.extractOne(parsed['contract_type'], contract_type_candidates, scorer=fuzz.token_set_ratio)
+                if contract_type_match and contract_type_score > 80:
+                    parsed['contract_type'] = contract_type_match
                 else:
-                    parsed['contractType'] = "Other"
+                    parsed['contract_type'] = "Other"
 
                 experience_level_candidates = ["Entry-Level", "Mid-Level", "Senior-Level", "Lead", "Director", "Executive"]
-                experience_level_match, experience_level_score, _ = process.extractOne(parsed['experienceLevel'], experience_level_candidates, scorer=fuzz.token_set_ratio)
-                if experience_level_match and experience_level_score > 70:
-                    parsed['experienceLevel'] = experience_level_match
+                experience_level_match, experience_level_score, _ = process.extractOne(parsed['experience_level'], experience_level_candidates, scorer=fuzz.token_set_ratio)
+                if experience_level_match and experience_level_score > 80:
+                    parsed['experience_level'] = experience_level_match
                 else:
-                    parsed['experienceLevel'] = "Entry-Level"
+                    parsed['experience_level'] = "Entry-Level"
                 
-                match_job_title, score_job_title, _ = process.extractOne(parsed["simplifiedJobTitle"], job_titles, scorer=fuzz.token_set_ratio)
-                if match_job_title and score_job_title > 70:
-                    parsed['simplifiedJobTitle'] = match_job_title
+                match_job_title, score_job_title, _ = process.extractOne(parsed["simplified_job_title"], job_titles, scorer=fuzz.token_set_ratio)
+                if match_job_title and score_job_title > 80:
+                    parsed['simplified_job_title'] = match_job_title
 
                 try:
                     # Build fields
@@ -368,7 +368,7 @@ def populate_enhanced_jobs():
                     # Upsert the enhanced job
                     result = conn.execute(text("""
                         INSERT INTO "EnhancedJobDetail" (
-                            "id", "jobTitle", "companyName", "companyLogoUrl", "companyIndustries",
+                            "id", "companyId", "jobTitle", "simplifiedJobTitle", "companyName", "companyLogoUrl", "companyIndustries",
                             "contractType", "location", "experienceLevel", "minExperience", "maxExperience",
                             "description", "responsibilities", "requiredProfile", "preferredProfile",
                             "skillsTag", "languageRequirements", "benefits", "salaryRange", "workArrangement",
@@ -376,7 +376,7 @@ def populate_enhanced_jobs():
                             "jobRawId", "createdAt", "updatedAt"
                         ) VALUES (
                             COALESCE((SELECT "id" FROM "EnhancedJobDetail" WHERE "jobRawId" = :jobRawId), :id),
-                            :jobTitle, :companyName, :companyLogoUrl, :companyIndustries,
+                            :companyId, :jobTitle, :simplifiedJobTitle, :companyName, :companyLogoUrl, :companyIndustries,
                             :contractType, :location, :experienceLevel, :minExperience, :maxExperience,
                             :description, :responsibilities, :requiredProfile, :preferredProfile,
                             :skillsTag, :languageRequirements, :benefits, :salaryRange, :workArrangement,
@@ -386,7 +386,9 @@ def populate_enhanced_jobs():
                             now()
                         )
                         ON CONFLICT ("jobRawId") DO UPDATE SET
+                            "companyId" = EXCLUDED."companyId",
                             "jobTitle" = EXCLUDED."jobTitle",
+                            "simplifiedJobTitle" = EXCLUDED."simplifiedJobTitle",
                             "companyName" = EXCLUDED."companyName",
                             "companyLogoUrl" = EXCLUDED."companyLogoUrl",
                             "companyIndustries" = EXCLUDED."companyIndustries",
@@ -412,9 +414,11 @@ def populate_enhanced_jobs():
                             "updatedAt" = now()
                     """), {
                         "id": cuid(),
+                        "companyId": data["companyId"],
                         "jobTitle": parsed.get("job_title"),
+                        "simplifiedJobTitle": parsed.get("simplified_job_title"),
                         "companyName": parsed.get("company_name"),
-                        "companyLogoUrl": parsed.get("company_logo_url"),
+                        "companyLogoUrl": data["company_logo_url"],
                         "companyIndustries": parsed.get("company_industries") or [],
                         "contractType": parsed.get("contract_type"),
                         "location": parsed.get("location"),
@@ -444,7 +448,7 @@ def populate_enhanced_jobs():
                     # Verify the inserted data
                     inserted_data = conn.execute(text("""
                         SELECT 
-                            "id", "jobTitle", "companyName", "location", 
+                            "id", "jobTitle", "simplifiedJobTitle", "companyName", "location", 
                             "experienceLevel", "contractType", "createdAt"
                         FROM "EnhancedJobDetail"
                         WHERE "jobRawId" = :job_raw_id
