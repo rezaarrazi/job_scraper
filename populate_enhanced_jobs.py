@@ -14,7 +14,9 @@ from tqdm import tqdm
 from datetime import datetime
 from rapidfuzz import process, fuzz
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import numpy as np
 import time
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 load_dotenv()
 
@@ -26,6 +28,10 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # Replace with your actual key
 # Setup logger
 logger = setup_logger(__name__, level=logging.DEBUG)
 
+class SkillTag(BaseModel):
+    required_skills_tag: List[str]
+    preferred_skills_tag: List[str]
+
 # --- Schema Definition ---
 class JobExtraction(BaseModel):
     job_title: str
@@ -33,7 +39,6 @@ class JobExtraction(BaseModel):
     simplified_job_title_standardized: str
     company_name: str
     company_logo_url: str
-    company_industries: List[str]
     contract_type: str
     location: str
     experience_level: str
@@ -43,7 +48,8 @@ class JobExtraction(BaseModel):
     responsibilities: List[str]
     required_profile: List[str]
     preferred_profile: List[str]
-    skills_tag: List[str]
+    skills_tag: SkillTag
+    tech_stack: List[str]
     language_requirements: List[str]
     work_arrangement: str
     linkedin_job_url: Optional[str]
@@ -84,13 +90,7 @@ Given a full job description, extract and format the following fields clearly an
    * The URL of the company logo
    * If not stated, leave it empty like `""`
 
-5. **companyIndustries**
-   * List of industries the company is in, use the industry mentioned in the job description or job metadata
-   * The industry should be specific, not general. For example, "Technology" is not a specific industry, but "E-commerce" or "Fintech" is. And don't write short form of the industry, for example, "Tech", "AI" is not a specific industry, but "Information Technology" or "Artificial Intelligence" is.
-   * If not stated, infer from job description, default to `["Other"]`
-   * Example: `["E-commerce", "Fintech"]`
-
-6. **contractType**
+5. **contractType**
    * Strictly select from the following list:
         - `"Full-Time"` : for full-time or permanent positions
         - `"Part-Time"` : for part-time positions
@@ -100,11 +100,11 @@ Given a full job description, extract and format the following fields clearly an
         - `"Other"` : for other contract types
    * If not stated, infer based on context, default to `"Full-time"`
 
-7. **location**
+6. **location**
    * Format: `"City, State/Province, Country"`
    * If missing, infer from job or company context
 
-8. **experienceLevel**
+7. **experienceLevel**
    * Reformulate the experience level from the job title and description, select from the following:
         - `"Entry-Level"`
         - `"Mid-Level"`  
@@ -114,7 +114,7 @@ Given a full job description, extract and format the following fields clearly an
         - `"Executive"`
    * If not stated, infer from title and description, default to `"Entry-Level"`
 
-9. **minExperience**
+8. **minExperience**
    * Integer: minimum required years of experience
    * If not stated, infer:
      * Entry: 0-2
@@ -122,22 +122,22 @@ Given a full job description, extract and format the following fields clearly an
      * Senior: 5-10
      * Lead+: 8-15
 
-10. **maxExperience**
+9. **maxExperience**
     * Integer: maximum years of experience
     * Should be higher or equal to minExperience
     * Leave it empty if not stated
 
-11. **description**
+10. **description**
     * A detailed description of the job role, including its purpose, scope, and expectations.
     * Translate to English if needed
     * Highlight role purpose and expectations
 
-12. **responsibilities**
+11. **responsibilities**
     * A structured list outlining the key duties and responsibilities associated with this role.
     * Use action-oriented statements
     * If not explicitly listed, extract from job body
 
-13. **requiredProfile**
+12. **requiredProfile**
     * List of essential qualifications or skills
     * Can include:
       * Technical skills (e.g., Java, SQL)
@@ -148,7 +148,7 @@ Given a full job description, extract and format the following fields clearly an
     * If not listed, infer based on job description, responsibilities and role type
     * Try to not leave it empty
 
-14. **preferredProfile**
+13. **preferredProfile**
     * A list of additional, nice-to-have skills that would be beneficial but are not mandatory. 
     * Includes:
       * Advanced degrees
@@ -158,13 +158,52 @@ Given a full job description, extract and format the following fields clearly an
     * If not stated, infer from context
     * Try to not leave it empty
 
-15. **skillsTag**
-    * List of short, high-level tags summarizing the technical scope/skills and tech stacks/tools used in the job
-    * Derived from:
-      * jobTitle
-      * requiredProfile and preferredProfile
-      * industry context
-    * Example: `["Backend", "Cloud", "DevOps", "React", "Node.js", "Python", "Docker", "Kubernetes", "AWS", "CI/CD", "Git", "SQL", "NoSQL", "PostgreSQL", "MySQL", "MongoDB", "Redis", "Elasticsearch", "Kafka", "RabbitMQ", "Docker", "Kubernetes", "AWS", "CI/CD", "Git", "SQL", "NoSQL", "PostgreSQL", "MySQL", "MongoDB", "Redis", "Elasticsearch", "Kafka", "RabbitMQ"]`
+14. **skillsTag**
+    Extract two separate lists of **skills** from the job description:
+
+    #### A. `requiredSkillsTag`
+
+    * Core **skills, competencies, or knowledge areas** that are explicitly required.
+    * Typically found in `jobTitle`, `requiredProfile`, responsibilities, or phrased as must-have.
+    * Include:
+
+    * Domain skills (e.g., `Credit Risk Modeling`, `Customer Acquisition`)
+    * Core abilities (e.g., `Data Analysis`, `Communication`, `Problem Solving`)
+    * Strongly emphasized soft skills (e.g., `Stakeholder Management`, `Collaboration`)
+
+    #### B. `preferredSkillsTag`
+
+    * **Nice-to-have** or optional skills.
+    * Found in `preferredProfile`, bonus qualifications, or supportive context.
+    * Include:
+
+    * Strategic or cross-functional skills (e.g., `Product Thinking`, `Leadership`)
+    * Industry familiarity (e.g., `Healthcare Analytics`, `AI Ethics`)
+    * Non-essential soft skills or niche expertise
+
+    #### General Guidelines:
+
+    * Focus only on **skills**, not tools or libraries
+    * Avoid vague words like “technologies” or “systems”
+    * Ensure **distinct, non-overlapping** lists
+
+15. **techStack**
+    Extract a **single list** of all **technologies, tools, programming languages, libraries, and platforms** mentioned in the job description.
+
+    #### techStack
+
+    * Include:
+
+    * Programming languages (e.g., `Python`, `SQL`, `Java`)
+    * ML/AI libraries (e.g., `TensorFlow`, `Scikit-Learn`, `LangChain`)
+    * DevOps/infra tools (e.g., `Docker`, `Kubernetes`, `Git`)
+    * Cloud and analytics platforms (e.g., `AWS`, `Google BigQuery`, `Snowflake`)
+
+    #### General Guidelines:
+
+    * Combine both required and preferred tools into one flat list
+    * Do not include abstract skills — focus only on tangible tools/libraries/platforms
+    * Maximize the number of **distinct, relevant** tech stack items
 
 16. **languageRequirements**
     * Required spoken/written language(s)
@@ -223,7 +262,7 @@ Given a full job description, extract and format the following fields clearly an
 
 ---
 
-Make sure your result is in **valid JSON**, with all arrays using proper brackets `[]`, and strings wrapped in quotes.
+Make sure your result is in **valid JSON**, with all arrays using proper brackets `[]`, and strings wrapped in quotes. please use the basic JSON syntax and do NOT include any extra whitespace or tabs for alignment.
 
 Input:
 {job_text}
@@ -234,6 +273,12 @@ client = openai.OpenAI(api_key=OPENAI_API_KEY)
 engine = create_engine(DATABASE_URL)
 
 # --- LLM Wrapper ---
+@retry(
+    stop=stop_after_attempt(3),  # Maximum 3 retries
+    wait=wait_exponential(multiplier=1, min=4, max=10),  # Wait between 4-10 seconds, increasing exponentially
+    retry=retry_if_exception_type((Exception,)),  # Retry on any exception
+    before_sleep=lambda retry_state: logger.warning(f"Retrying LLM call after error. Attempt {retry_state.attempt_number}/3")
+)
 def call_llm(job_text):
     try:
         client = genai.Client(api_key=GEMINI_API_KEY)
@@ -248,17 +293,19 @@ def call_llm(job_text):
             config={
                 'response_mime_type': 'application/json',
                 'response_schema': JobExtraction,
+                'temperature': 0.2
             }
         )
         
         if response.parsed:
             return response.parsed.model_dump(mode='json')
         else:
-            print(f"❌ LLM Error: {response.text}")
-            return None
+            error_msg = f"❌ LLM Error: {response.text}"
+            logger.error(error_msg)
+            raise Exception(error_msg)  # Raise exception to trigger retry
     except Exception as e:
-        print(f"❌ LLM Error: {e}")
-        return None
+        logger.error(f"❌ LLM Error: {str(e)}")
+        raise  # Re-raise the exception to trigger retry
 
 # --- Embedding Helpers ---
 def generate_embedding(text: str):
@@ -271,6 +318,26 @@ def generate_embedding(text: str):
     except Exception as e:
         print(f"❌ Embedding error: {e}")
         return None
+
+def standardize_with_exact_match(value: str, reference_list: list, threshold: int = 80) -> str:
+    """
+    Standardize a value by first checking for exact match, then using fuzzy matching if no exact match is found.
+    
+    Args:
+        value: The value to standardize
+        reference_list: List of reference values to match against
+        threshold: Minimum score for fuzzy matching (default: 80)
+        
+    Returns:
+        Standardized value (exact match if found, fuzzy match if score > threshold, original value otherwise)
+    """
+    # First check for exact match
+    if value in reference_list:
+        return value
+        
+    # If no exact match, try fuzzy matching
+    match, score, _ = process.extractOne(value, reference_list, scorer=fuzz.token_set_ratio)
+    return match if match and score > threshold else value
 
 def process_job_worker(row: Any, industries_candidates: List[str], job_titles: List[str], engine) -> Dict[str, Any]:
     """Worker function to process a single job"""
@@ -289,54 +356,27 @@ def process_job_worker(row: Any, industries_candidates: List[str], job_titles: L
         if not parsed:
             logger.warning(f"⚠️ Skipped due to LLM error for job: {row.jobTitle}")
             return None
-
-        # Process industries
-        industries = []
-        for industry in parsed['company_industries']:
-            match, score, _ = process.extractOne(industry, industries_candidates, scorer=fuzz.token_set_ratio)
-            if match and score > 80:
-                industries.append(match)
-            else:
-                industries.append(industry)
-        parsed['company_industries'] = industries
+        
+        parsed['company_industries'] = data['company_industry1'].split(',')
 
         # Process contract type
         contract_type_candidates = ["Full-Time", "Part-Time", "Contract", "Freelance", "Internship"]
-        contract_type_match, contract_type_score, _ = process.extractOne(parsed['contract_type'], contract_type_candidates, scorer=fuzz.token_set_ratio)
-        if contract_type_match and contract_type_score > 80:
-            parsed['contract_type'] = contract_type_match
-        else:
-            parsed['contract_type'] = "Other"
+        standardized_contract_type = standardize_with_exact_match(parsed['contract_type'], contract_type_candidates)
+        parsed['contract_type'] = standardized_contract_type
 
         # Process experience level
         experience_level_candidates = ["Entry-Level", "Mid-Level", "Senior-Level", "Lead", "Director", "Executive"]
-        experience_level_match, experience_level_score, _ = process.extractOne(parsed['experience_level'], experience_level_candidates, scorer=fuzz.token_set_ratio)
-        if experience_level_match and experience_level_score > 80:
-            parsed['experience_level'] = experience_level_match
-        else:
-            parsed['experience_level'] = "Entry-Level"
+        standardized_experience_level = standardize_with_exact_match(parsed['experience_level'], experience_level_candidates)
+        parsed['experience_level'] = standardized_experience_level
         
         # Process job title
-        match_job_title, score_job_title, _ = process.extractOne(parsed["simplified_job_title"], job_titles, scorer=fuzz.token_set_ratio)
-        if match_job_title and score_job_title > 80:
-            parsed['simplified_job_title_standardized'] = match_job_title
-
-        # Generate embeddings
-        overall_text = "\n".join(filter(None, [
-            f"Job Title: {parsed['job_title']}",
-            f"\nDescription:\n{parsed['description'] or ''}",
-            f"\nResponsibilities:" + "\n- ".join(parsed['responsibilities']) if parsed['responsibilities'] else "",
-            f"\nRequired Profile:" + "\n- ".join(parsed['required_profile']) if parsed['required_profile'] else "",
-            f"\nPreferred Profile:" + "\n- ".join(parsed['preferred_profile']) if parsed['preferred_profile'] else "",
-        ]))
-        embedding = generate_embedding(overall_text)
-        embedding_json = json.dumps(embedding) if embedding else None
-
+        standardized_job_title = standardize_with_exact_match(parsed["simplified_job_title"], job_titles)
+        parsed['simplified_job_title_standardized'] = standardized_job_title
+        
         return {
             "job_raw_id": job_raw_id,
             "data": data,
-            "parsed": parsed,
-            "embedding_json": embedding_json
+            "parsed": parsed
         }
     except Exception as e:
         logger.error(f"❌ Error processing job {row.jobTitle}: {str(e)}")
@@ -367,7 +407,9 @@ def populate_enhanced_jobs():
                     csd."industry" as company_industry2,
                     csd."location" as company_location,
                     csd."companySize" as company_size,
-                    csd."about" as company_about
+                    csd."about" as company_about,
+                    csd."type" as company_type,
+                    csd."enhancedDescription" as company_enhanced_description
                 FROM "JobRaw" jr
                 LEFT JOIN "Company" c ON jr."companyId" = c."id"
                 LEFT JOIN "CompanyScrapingdog" csd ON c."id" = csd."companyId"
@@ -405,31 +447,34 @@ def populate_enhanced_jobs():
                                 try:
                                     conn.execute(text("""
                                         INSERT INTO "EnhancedJobDetail" (
-                                            "id", "companyId", "jobTitle", "simplifiedJobTitle", "simplifiedJobTitleStandardized", "companyName", "companyLogoUrl", "companyIndustries",
-                                            "contractType", "location", "experienceLevel", "minExperience", "maxExperience",
+                                            "id", "jobTitle", "simplifiedJobTitle", "simplifiedJobTitleStandardized",
+                                            "companyName", "companyLogoUrl", "companyIndustries", "companyType", "companyDescription", "contractType",
+                                            "location", "experienceLevel", "minExperience", "maxExperience",
                                             "description", "responsibilities", "requiredProfile", "preferredProfile",
-                                            "skillsTag", "languageRequirements", "benefits", "salaryRange", "workArrangement",
-                                            "linkedinJobUrl", "url", "isExternal", "minimumEducationLevel", "embedding",
-                                            "jobRawId", "createdAt", "updatedAt"
+                                            "skillsTag", "techStack", "languageRequirements", "benefits", "salaryRange",
+                                            "workArrangement", "linkedinJobUrl", "url", "minimumEducationLevel",
+                                            "isExternal", "jobRawId", "companyId", "createdAt", "updatedAt"
                                         ) VALUES (
                                             COALESCE((SELECT "id" FROM "EnhancedJobDetail" WHERE "jobRawId" = :jobRawId), :id),
-                                            :companyId, :jobTitle, :simplifiedJobTitle, :simplifiedJobTitleStandardized, :companyName, :companyLogoUrl, :companyIndustries,
-                                            :contractType, :location, :experienceLevel, :minExperience, :maxExperience,
+                                            :jobTitle, :simplifiedJobTitle, :simplifiedJobTitleStandardized,
+                                            :companyName, :companyLogoUrl, :companyIndustries, :companyType, :companyDescription, :contractType,
+                                            :location, :experienceLevel, :minExperience, :maxExperience,
                                             :description, :responsibilities, :requiredProfile, :preferredProfile,
-                                            :skillsTag, :languageRequirements, :benefits, :salaryRange, :workArrangement,
-                                            :linkedinJobUrl, :url, :isExternal, :minimumEducationLevel, :embedding,
-                                            :jobRawId,
+                                            :skillsTag, :techStack, :languageRequirements, :benefits, :salaryRange,
+                                            :workArrangement, :linkedinJobUrl, :url, :minimumEducationLevel,
+                                            :isExternal, :jobRawId, :companyId,
                                             COALESCE((SELECT "createdAt" FROM "EnhancedJobDetail" WHERE "jobRawId" = :jobRawId), now()),
                                             now()
                                         )
                                         ON CONFLICT ("jobRawId") DO UPDATE SET
-                                            "companyId" = EXCLUDED."companyId",
                                             "jobTitle" = EXCLUDED."jobTitle",
                                             "simplifiedJobTitle" = EXCLUDED."simplifiedJobTitle",
                                             "simplifiedJobTitleStandardized" = EXCLUDED."simplifiedJobTitleStandardized",
                                             "companyName" = EXCLUDED."companyName",
                                             "companyLogoUrl" = EXCLUDED."companyLogoUrl",
                                             "companyIndustries" = EXCLUDED."companyIndustries",
+                                            "companyType" = EXCLUDED."companyType",
+                                            "companyDescription" = EXCLUDED."companyDescription",
                                             "contractType" = EXCLUDED."contractType",
                                             "location" = EXCLUDED."location",
                                             "experienceLevel" = EXCLUDED."experienceLevel",
@@ -440,25 +485,27 @@ def populate_enhanced_jobs():
                                             "requiredProfile" = EXCLUDED."requiredProfile",
                                             "preferredProfile" = EXCLUDED."preferredProfile",
                                             "skillsTag" = EXCLUDED."skillsTag",
+                                            "techStack" = EXCLUDED."techStack",
                                             "languageRequirements" = EXCLUDED."languageRequirements",
                                             "benefits" = EXCLUDED."benefits",
                                             "salaryRange" = EXCLUDED."salaryRange",
                                             "workArrangement" = EXCLUDED."workArrangement",
                                             "linkedinJobUrl" = EXCLUDED."linkedinJobUrl",
                                             "url" = EXCLUDED."url",
-                                            "isExternal" = EXCLUDED."isExternal",
                                             "minimumEducationLevel" = EXCLUDED."minimumEducationLevel",
-                                            "embedding" = EXCLUDED."embedding",
+                                            "isExternal" = EXCLUDED."isExternal",
+                                            "companyId" = EXCLUDED."companyId",
                                             "updatedAt" = now()
                                     """), {
                                         "id": cuid(),
-                                        "companyId": result["data"]["companyId"],
                                         "jobTitle": result["parsed"].get("job_title"),
                                         "simplifiedJobTitle": result["parsed"].get("simplified_job_title"),
                                         "simplifiedJobTitleStandardized": result["parsed"].get("simplified_job_title_standardized"),
                                         "companyName": result["parsed"].get("company_name"),
                                         "companyLogoUrl": result["data"]["company_logo_url"],
                                         "companyIndustries": result["parsed"].get("company_industries") or [],
+                                        "companyType": result["data"]["company_type"],
+                                        "companyDescription": result["data"]["company_enhanced_description"],
                                         "contractType": result["parsed"].get("contract_type"),
                                         "location": result["parsed"].get("location"),
                                         "experienceLevel": result["parsed"].get("experience_level"),
@@ -468,17 +515,21 @@ def populate_enhanced_jobs():
                                         "responsibilities": result["parsed"].get("responsibilities") or [],
                                         "requiredProfile": result["parsed"].get("required_profile") or [],
                                         "preferredProfile": result["parsed"].get("preferred_profile") or [],
-                                        "skillsTag": result["parsed"].get("skills_tag") or [],
+                                        "skillsTag": json.dumps({
+                                            "requiredSkillsTag": result["parsed"].get("skills_tag", {}).get("required_skills_tag", []),
+                                            "preferredSkillsTag": result["parsed"].get("skills_tag", {}).get("preferred_skills_tag", [])
+                                        }),
+                                        "techStack": result["parsed"].get("tech_stack") or [],
                                         "languageRequirements": result["parsed"].get("language_requirements") or [],
                                         "benefits": result["parsed"].get("benefits") or [],
                                         "salaryRange": result["parsed"].get("salary_range"),
                                         "workArrangement": result["parsed"].get("work_arrangement"),
                                         "linkedinJobUrl": result["parsed"].get("linkedin_job_url"),
                                         "url": result["parsed"].get("url"),
-                                        "isExternal": False,
                                         "minimumEducationLevel": result["parsed"].get("minimum_education_level"),
-                                        "embedding": result["embedding_json"],
-                                        "jobRawId": result["job_raw_id"]
+                                        "isExternal": False,
+                                        "jobRawId": result["job_raw_id"],
+                                        "companyId": result["data"]["companyId"]
                                     })
                                     conn.commit()
                                     successful_jobs += 1

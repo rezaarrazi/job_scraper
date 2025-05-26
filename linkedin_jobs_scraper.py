@@ -29,6 +29,8 @@ class LinkedInJobScraper:
             auth_file
         )
 
+        logger.info(f"Using authentication file: {self.auth_file}")
+
     def ensure_authenticated(self, page) -> bool:
         """Check if we're authenticated, if not, perform login."""
         if page.url.startswith('https://www.linkedin.com/login'):
@@ -120,6 +122,17 @@ class LinkedInJobScraper:
 
         # open one of the linkedin_job_url and save the html content to a file
         page.goto(f"https://www.linkedin.com{linkedin_job_url}")
+
+        #   Check if job is no longer accepting applications
+        try:
+            error_message = page.locator(".jobs-details-top-card__apply-error .artdeco-inline-feedback__message").text_content()
+            if error_message and "No longer accepting applications" in error_message:
+                details["is_active"] = False
+                return details
+        except Exception as e:
+            logger.debug(f"Error checking job status: {str(e)}")
+        
+        details["is_active"] = True
 
         # Extract job insights
         try:
