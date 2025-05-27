@@ -8,6 +8,8 @@ import json
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 from utils.logger import setup_logger
+from utils.ai_client import AIClient
+
 import logging
 from dotenv import load_dotenv
 from tqdm import tqdm
@@ -184,7 +186,7 @@ Given a full job description, extract and format the following fields clearly an
     #### General Guidelines:
 
     * Focus only on **skills**, not tools or libraries
-    * Avoid vague words like “technologies” or “systems”
+    * Avoid vague words like "technologies" or "systems"
     * Ensure **distinct, non-overlapping** lists
 
 15. **techStack**
@@ -268,11 +270,12 @@ Input:
 {job_text}
 '''
 
-client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
 engine = create_engine(DATABASE_URL)
 
-# --- LLM Wrapper ---
+gemini_client = AIClient(provider='gemini', api_key=GEMINI_API_KEY)
+openai_client = AIClient(provider='openai', api_key=OPENAI_API_KEY)
+
 @retry(
     stop=stop_after_attempt(3),  # Maximum 3 retries
     wait=wait_exponential(multiplier=1, min=4, max=10),  # Wait between 4-10 seconds, increasing exponentially
@@ -281,28 +284,21 @@ engine = create_engine(DATABASE_URL)
 )
 def call_llm(job_text):
     try:
-        client = genai.Client(api_key=GEMINI_API_KEY)
-
         prompt = JOB_EXTRACTION_PROMPT.format(job_text=job_text)
         
-        response = client.models.generate_content(
-            model='gemini-2.0-flash',
-            contents=[
-                prompt,
-            ],
-            config={
-                'response_mime_type': 'application/json',
-                'response_schema': JobExtraction,
-                'temperature': 0.2
-            }
-        )
+        response = gemini_client.generate_text(
+                    model='gemini-2.5-flash',
+                    prompt=prompt,
+                    response_schema=JobExtraction,
+                    config={
+                        'response_mime_type': 'application/json',
+                        'max_output_tokens': 65535,
+                        'temperature': 0.2
+                    },
+                    parse_response=True
+                )
         
-        if response.parsed:
-            return response.parsed.model_dump(mode='json')
-        else:
-            error_msg = f"❌ LLM Error: {response.text}"
-            logger.error(error_msg)
-            raise Exception(error_msg)  # Raise exception to trigger retry
+        return response
     except Exception as e:
         logger.error(f"❌ LLM Error: {str(e)}")
         raise  # Re-raise the exception to trigger retry
@@ -310,14 +306,58 @@ def call_llm(job_text):
 # --- Embedding Helpers ---
 def generate_embedding(text: str):
     try:
-        response = client.embeddings.create(
-            model="text-embedding-ada-002",
-            input=text
-        )
-        return response.data[0].embedding
+        response = openai_client.generate_embedding(text, model="text-embedding-3-small")
+        return response
     except Exception as e:
         print(f"❌ Embedding error: {e}")
         return None
+
+def process_skill_embeddings(conn, skills: List[str]) -> Dict[str, List[float]]:
+    """
+    Process a list of skills, generating and storing embeddings for each one.
+    Returns a dictionary mapping skills to their embeddings.
+    """
+    skill_embeddings = {}
+    
+    for skill in skills:
+        if not skill:
+            continue
+            
+        # Check if embedding already exists
+        existing = conn.execute(text("""
+            SELECT "embedding" FROM "SkillEmbedding" WHERE "skill" = :skill
+        """), {"skill": skill}).fetchone()
+        
+        if existing:
+            skill_embeddings[skill] = existing[0]
+            continue
+            
+        # Generate new embedding
+        embedding = generate_embedding(skill)
+        if not embedding:
+            logger.warning(f"⚠️ Failed to generate embedding for skill: {skill}")
+            continue
+            
+        # Store the embedding
+        try:
+            conn.execute(text("""
+                INSERT INTO "SkillEmbedding" ("id", "skill", "embedding", "createdAt", "updatedAt")
+                VALUES (:id, :skill, :embedding, NOW(), NOW())
+                ON CONFLICT ("skill") DO UPDATE SET
+                    "embedding" = EXCLUDED."embedding",
+                    "updatedAt" = NOW()
+            """), {
+                "id": cuid(),
+                "skill": skill,
+                "embedding": json.dumps(embedding)
+            })
+            conn.commit()
+            skill_embeddings[skill] = embedding
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"❌ Error storing embedding for skill {skill}: {str(e)}")
+            
+    return skill_embeddings
 
 def standardize_with_exact_match(value: str, reference_list: list, threshold: int = 80) -> str:
     """
@@ -357,7 +397,12 @@ def process_job_worker(row: Any, industries_candidates: List[str], job_titles: L
             logger.warning(f"⚠️ Skipped due to LLM error for job: {row.jobTitle}")
             return None
         
-        parsed['company_industries'] = data['company_industry1'].split(',')
+        company_industries = data['company_industry1'] if data['company_industry1'] else data['company_industry2']
+
+        if company_industries:
+            parsed['company_industries'] = company_industries.split(',')
+        else:
+            parsed['company_industries'] = []
 
         # Process contract type
         contract_type_candidates = ["Full-Time", "Part-Time", "Contract", "Freelance", "Internship"]
@@ -372,6 +417,21 @@ def process_job_worker(row: Any, industries_candidates: List[str], job_titles: L
         # Process job title
         standardized_job_title = standardize_with_exact_match(parsed["simplified_job_title"], job_titles)
         parsed['simplified_job_title_standardized'] = standardized_job_title
+
+        # Process skill embeddings
+        with engine.connect() as conn:
+            required_skills = parsed.get("skills_tag", {}).get("required_skills_tag", [])
+            preferred_skills = parsed.get("skills_tag", {}).get("preferred_skills_tag", [])
+            
+            # Generate embeddings for all skills
+            required_skill_embeddings = process_skill_embeddings(conn, required_skills)
+            preferred_skill_embeddings = process_skill_embeddings(conn, preferred_skills)
+            
+            # Add embeddings to the parsed data
+            parsed['skillEmbeddings'] = {
+                "requiredSkills": {skill: embedding for skill, embedding in required_skill_embeddings.items()},
+                "preferredSkills": {skill: embedding for skill, embedding in preferred_skill_embeddings.items()}
+            }
         
         return {
             "job_raw_id": job_raw_id,
@@ -383,20 +443,20 @@ def process_job_worker(row: Any, industries_candidates: List[str], job_titles: L
         return None
 
 def populate_enhanced_jobs():
-    industries_candidates = pd.read_csv(os.path.join(os.getcwd(), 'data/output/industries/unique_industries.csv'))['industry'].tolist()
-    # Load job titles from JSON
-    job_categories_path = os.path.join(os.getcwd(), './data/output/job_category/jobright_job_categories.json')
-    with open(job_categories_path, 'r') as f:
-        job_categories = json.load(f)
-    
-    # Extract all job titles into a flat list
-    job_titles = []
-    for category in job_categories.values():
-        for subcategory in category.values():
-            job_titles.extend(subcategory)
-
     try:
         with engine.connect() as conn:
+            industries_candidates = pd.read_csv(os.path.join(os.getcwd(), 'data/output/industries/unique_industries.csv'))['industry'].tolist()
+            # Load job titles from JSON
+            job_categories_path = os.path.join(os.getcwd(), './data/output/job_category/jobright_job_categories.json')
+            with open(job_categories_path, 'r') as f:
+                job_categories = json.load(f)
+            
+            # Extract all job titles into a flat list
+            job_titles = []
+            for category in job_categories.values():
+                for subcategory in category.values():
+                    job_titles.extend(subcategory)
+
             # Get jobs that haven't been processed yet
             rows = conn.execute(text("""
                 SELECT 
@@ -404,7 +464,7 @@ def populate_enhanced_jobs():
                     c."organizationName" as company_name,
                     csd."profilePhoto" as company_logo_url,
                     c."industries" as company_industry1,
-                    csd."industry" as company_industry2,
+                    csd."industries" as company_industry2,
                     csd."location" as company_location,
                     csd."companySize" as company_size,
                     csd."about" as company_about,
@@ -414,7 +474,7 @@ def populate_enhanced_jobs():
                 LEFT JOIN "Company" c ON jr."companyId" = c."id"
                 LEFT JOIN "CompanyScrapingdog" csd ON c."id" = csd."companyId"
                 LEFT JOIN "EnhancedJobDetail" ejd ON jr."id" = ejd."jobRawId"
-                WHERE ejd."id" IS NULL
+                WHERE ejd."id" IS NULL and c."id" IS NOT NULL
             """)).fetchall()
 
             logger.debug(f"Found {len(rows)} jobs to process")
@@ -451,7 +511,7 @@ def populate_enhanced_jobs():
                                             "companyName", "companyLogoUrl", "companyIndustries", "companyType", "companyDescription", "contractType",
                                             "location", "experienceLevel", "minExperience", "maxExperience",
                                             "description", "responsibilities", "requiredProfile", "preferredProfile",
-                                            "skillsTag", "techStack", "languageRequirements", "benefits", "salaryRange",
+                                            "skillsTag", "skillEmbeddings", "techStack", "languageRequirements", "benefits", "salaryRange",
                                             "workArrangement", "linkedinJobUrl", "url", "minimumEducationLevel",
                                             "isExternal", "jobRawId", "companyId", "createdAt", "updatedAt"
                                         ) VALUES (
@@ -460,7 +520,7 @@ def populate_enhanced_jobs():
                                             :companyName, :companyLogoUrl, :companyIndustries, :companyType, :companyDescription, :contractType,
                                             :location, :experienceLevel, :minExperience, :maxExperience,
                                             :description, :responsibilities, :requiredProfile, :preferredProfile,
-                                            :skillsTag, :techStack, :languageRequirements, :benefits, :salaryRange,
+                                            :skillsTag, :skillEmbeddings, :techStack, :languageRequirements, :benefits, :salaryRange,
                                             :workArrangement, :linkedinJobUrl, :url, :minimumEducationLevel,
                                             :isExternal, :jobRawId, :companyId,
                                             COALESCE((SELECT "createdAt" FROM "EnhancedJobDetail" WHERE "jobRawId" = :jobRawId), now()),
@@ -485,6 +545,7 @@ def populate_enhanced_jobs():
                                             "requiredProfile" = EXCLUDED."requiredProfile",
                                             "preferredProfile" = EXCLUDED."preferredProfile",
                                             "skillsTag" = EXCLUDED."skillsTag",
+                                            "skillEmbeddings" = EXCLUDED."skillEmbeddings",
                                             "techStack" = EXCLUDED."techStack",
                                             "languageRequirements" = EXCLUDED."languageRequirements",
                                             "benefits" = EXCLUDED."benefits",
@@ -519,6 +580,7 @@ def populate_enhanced_jobs():
                                             "requiredSkillsTag": result["parsed"].get("skills_tag", {}).get("required_skills_tag", []),
                                             "preferredSkillsTag": result["parsed"].get("skills_tag", {}).get("preferred_skills_tag", [])
                                         }),
+                                        "skillEmbeddings": json.dumps(result["parsed"].get("skillEmbeddings", {})),
                                         "techStack": result["parsed"].get("tech_stack") or [],
                                         "languageRequirements": result["parsed"].get("language_requirements") or [],
                                         "benefits": result["parsed"].get("benefits") or [],

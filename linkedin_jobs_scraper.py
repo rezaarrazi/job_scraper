@@ -2,7 +2,7 @@ import os
 from playwright.sync_api import sync_playwright
 from dotenv import load_dotenv
 from datetime import datetime
-from typing import List, Dict
+from typing import List, Dict, Tuple
 import csv
 from utils.logger import setup_logger
 import re
@@ -11,33 +11,42 @@ import json
 from tqdm import tqdm
 import time
 import random
+import multiprocessing
+from itertools import cycle
+import pandas as pd
+from dataclasses import dataclass
+from typing import Optional
+
 # Load environment variables
 load_dotenv()
 
 # Setup logger
 logger = setup_logger(__name__)
 
-class LinkedInJobScraper:
-    def __init__(self, auth_file: str = None):
-        """Initialize the scraper with optional authentication file."""
-        if auth_file:
-            auth_file = 'linkedin_auth.json'
+@dataclass
+class LinkedInCredentials:
+    username: str
+    password: str
+    auth_file: str
 
+class LinkedInJobScraper:
+    def __init__(self, credentials: LinkedInCredentials):
+        """Initialize the scraper with credentials."""
+        self.credentials = credentials
         self.auth_file = os.path.join(
             os.path.dirname(__file__), 
             '.auth', 
-            auth_file
+            credentials.auth_file
         )
-
         logger.info(f"Using authentication file: {self.auth_file}")
 
     def ensure_authenticated(self, page) -> bool:
         """Check if we're authenticated, if not, perform login."""
         if page.url.startswith('https://www.linkedin.com/login'):
             # Need to login
-            logger.info("Logging in to LinkedIn...")
-            page.fill('#username', os.getenv('LINKEDIN_USERNAME'))
-            page.fill('#password', os.getenv('LINKEDIN_PASSWORD'))
+            logger.info(f"Logging in to LinkedIn with account: {self.credentials.username}")
+            page.fill('#username', self.credentials.username)
+            page.fill('#password', self.credentials.password)
             page.click('button[type="submit"]')
             
             # Wait for navigation after login
@@ -196,13 +205,28 @@ class LinkedInJobScraper:
         all_jobs = []
         
         with sync_playwright() as p:
-            # Launch browser with saved authentication if available
-            browser = p.chromium.launch(headless=headless)  # Set to True in production
+            # Launch browser with saved authentication if available and performance optimizations
+            browser = p.chromium.launch(
+                headless=headless,
+                args=[
+                    '--disable-blink-features=AutomationControlled',
+                    '--disable-dev-shm-usage',
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-gpu',
+                    '--disable-background-timer-throttling',
+                    '--disable-backgrounding-occluded-windows',
+                    '--disable-renderer-backgrounding'
+                ]
+            )
             context = browser.new_context(
                 storage_state=self.auth_file if os.path.exists(self.auth_file) else None
             )
             
             page = context.new_page()
+            
+            # Set shorter timeouts for better performance
+            page.set_default_timeout(15000)  # 15 seconds instead of default 30
             
             try:
                 # Navigate to the company's jobs page
@@ -312,57 +336,113 @@ class LinkedInJobScraper:
         jobs = []
         
         try:
-            # Wait for job cards to be visible
-            page.wait_for_selector('div.job-card-container', state='visible')
+            # Wait for job cards to be visible with reduced timeout
+            page.wait_for_selector('div.job-card-container', state='visible', timeout=10000)
             
-            # Get all job cards
-            job_cards = page.locator('div.job-card-container').all()
+            # Extract all job data in a single JavaScript evaluation for better performance
+            jobs_data = page.evaluate('''
+                () => {
+                    const jobCards = document.querySelectorAll('div.job-card-container');
+                    const jobs = [];
+                    
+                    jobCards.forEach(card => {
+                        try {
+                            const jobLink = card.querySelector('a.job-card-container__link');
+                            if (!jobLink) return;
+                            
+                            const href = jobLink.getAttribute('href');
+                            if (!href || !href.includes('/jobs/view/')) return;
+                            
+                            const jobInfo = {
+                                linkedin_job_url: href
+                            };
+                            
+                            // Extract job ID from URL
+                            const jobIdMatch = href.match(/\/jobs\/view\/(\d+)\//);
+                            if (jobIdMatch) {
+                                jobInfo.job_id = jobIdMatch[1];
+                            }
+                            
+                            // Extract job title
+                            const titleElem = card.querySelector('a.job-card-container__link span[aria-hidden="true"] strong');
+                            if (titleElem) {
+                                jobInfo.job_title = titleElem.textContent.trim();
+                            }
+                            
+                            // Extract company name
+                            const companyElem = card.querySelector('div.artdeco-entity-lockup__subtitle span');
+                            if (companyElem) {
+                                jobInfo.company_name = companyElem.textContent.trim();
+                            }
+                            
+                            // Extract location
+                            const locationElem = card.querySelector('ul.job-card-container__metadata-wrapper li span');
+                            if (locationElem) {
+                                jobInfo.location = locationElem.textContent.trim();
+                            }
+                            
+                            // Extract posted date
+                            const postedDateElem = card.querySelector('li.job-card-container__footer-item time');
+                            if (postedDateElem) {
+                                const postedDate = postedDateElem.getAttribute('datetime');
+                                if (postedDate) {
+                                    jobInfo.posted_date = postedDate;
+                                }
+                            }
+                            
+                            if (Object.keys(jobInfo).length > 1) { // More than just the URL
+                                jobs.push(jobInfo);
+                            }
+                            
+                        } catch (error) {
+                            console.error('Error extracting job card:', error);
+                        }
+                    });
+                    
+                    return jobs;
+                }
+            ''')
             
-            for card in job_cards:
-                job_info = {}
-                
-                try:
-                    # Extract job link and ID
-                    job_link = card.locator('a.job-card-container__link').first
-                    if job_link:
-                        href = job_link.get_attribute('href')
-
-                        if href:
-                            if '/jobs/view/' not in href:
-                                continue    
-                            
-                            job_info['linkedin_job_url'] = href
-                            # Extract job ID from URL
-                            job_id_match = re.search(r'/jobs/view/(\d+)/', href)
-                            if job_id_match:
-                                job_info['job_id'] = job_id_match.group(1)
-                    
-                            # Extract job title
-                            title_elem = card.locator('a.job-card-container__link span[aria-hidden="true"] strong').first
-                            if title_elem:
-                                job_info['job_title'] = title_elem.inner_text().strip()
-                            
-                            # Extract company name - look for the subtitle span
-                            company_elem = card.locator('div.artdeco-entity-lockup__subtitle span').first
-                            if company_elem:
-                                job_info['company_name'] = company_elem.inner_text().strip()
-                            
-                            # Extract location - look for the metadata list item
-                            location_elem = card.locator('ul.job-card-container__metadata-wrapper li span').first
-                            if location_elem:
-                                job_info['location'] = location_elem.inner_text().strip()
-                            
-                            if job_info:  # Only add if we got at least some information
-                                jobs.append(job_info)
-                        
-                except Exception as e:
-                    logger.error(f"Error extracting job card details: {str(e)}")
-                    continue
-                    
+            jobs = jobs_data
+            
         except Exception as e:
             logger.error(f"Error extracting job cards: {str(e)}")
             
         return jobs
+
+def process_companies_chunk(args: Tuple[List[Dict], List[LinkedInCredentials], str, bool, int]) -> None:
+    """Process a chunk of companies using a specific account."""
+    companies_chunk, credentials, dir_prefix_date, headless, worker_id = args
+    
+    # Initialize scraper with the assigned credentials
+    scraper = LinkedInJobScraper(credentials)
+    
+    for idx, company in enumerate(companies_chunk):
+        current = idx + 1
+        total = len(companies_chunk)
+        org_name = company['Organization Name']
+        linkedin_url = company['LinkedIn']
+        
+        if pd.isna(linkedin_url) or not linkedin_url:
+            logger.warning(f"[Worker {worker_id}] [{current}/{total}] Skipping {org_name} - no LinkedIn URL provided")
+            continue
+            
+        # Ensure the URL ends with /jobs/
+        base_url = linkedin_url.rstrip('/')
+        linkedin_jobs_url = f"{base_url}/jobs/"
+        
+        logger.info(f"[Worker {worker_id}] [{current}/{total}] Processing {org_name} - {linkedin_jobs_url}")
+        jobs = scraper.scrape_company_jobs(linkedin_jobs_url, org_name, dir_prefix_date, headless)
+        
+        if jobs:
+            logger.info(f"[Worker {worker_id}] [{current}/{total}] Successfully scraped {len(jobs)} jobs from {org_name}")
+        else:
+            logger.warning(f"[Worker {worker_id}] [{current}/{total}] No jobs were scraped for {org_name}")
+        
+        # Add random delay between companies
+        wait_time = random.randint(1, 5)
+        logger.info(f"[Worker {worker_id}] Waiting {wait_time} seconds before next company...")
+        time.sleep(wait_time)
 
 def main():
     """Main function to run the LinkedIn job scraper."""
@@ -383,18 +463,20 @@ def main():
     parser.add_argument('--headless', 
                        action='store_true',
                        help='Run in headless mode')
+    parser.add_argument('--num-workers',
+                       type=int,
+                       default=1,
+                       help='Number of parallel workers to use (default: 1)')
+    parser.add_argument('--accounts-file',
+                       help='Path to JSON file containing LinkedIn account credentials')
     
     args = parser.parse_args()
     
-    # Initialize the scraper
-    scraper = LinkedInJobScraper(auth_file=args.auth_file)
-
     dir_prefix_date = datetime.now().strftime('%Y%m%d_%H%M%S')
     
     if args.companies_data_file:
         # Process companies from CSV file
         try:
-            import pandas as pd
             companies_df = pd.read_csv(args.companies_data_file)
             required_columns = ['Organization Name', 'LinkedIn']
             
@@ -406,40 +488,65 @@ def main():
             if args.start_index >= total_companies:
                 logger.error(f"Start index {args.start_index} is out of range. File has {total_companies} companies.")
                 return
-                
-            logger.info(f"Found {total_companies} companies to process")
-            logger.info(f"Starting from index {args.start_index}")
+
+            # Load LinkedIn accounts
+            if not args.accounts_file:
+                logger.error("--accounts-file is required for parallel processing")
+                return
+
+            with open(args.accounts_file, 'r') as f:
+                accounts_data = json.load(f)
             
-            for idx, row in companies_df.iloc[args.start_index:].iterrows():
-                current = idx + 1
-                org_name = row['Organization Name']
-                linkedin_url = row['LinkedIn']
-                
-                if pd.isna(linkedin_url) or not linkedin_url:
-                    logger.warning(f"[{current}/{total_companies}] Skipping {org_name} - no LinkedIn URL provided")
-                    continue
-                    
-                # Ensure the URL ends with /jobs/ by removing any trailing slash first
-                base_url = linkedin_url.rstrip('/')
-                linkedin_jobs_url = f"{base_url}/jobs/"
-                
-                logger.info(f"[{current}/{total_companies}] Processing {org_name} - {linkedin_jobs_url}")
-                jobs = scraper.scrape_company_jobs(linkedin_jobs_url, org_name, dir_prefix_date, args.headless)
-                
-                if jobs:
-                    logger.info(f"[{current}/{total_companies}] Successfully scraped {len(jobs)} jobs from {org_name}")
-                else:
-                    logger.warning(f"[{current}/{total_companies}] No jobs were scraped for {org_name}")
-                
-                wait_time = random.randint(1, 5)
-                logger.info(f"Waiting {wait_time} seconds before next company...")
-                time.sleep(wait_time)
-                    
+            credentials_list = [
+                LinkedInCredentials(
+                    username=account['username'],
+                    password=account['password'],
+                    auth_file=account['auth_file']
+                )
+                for i, account in enumerate(accounts_data)
+            ]
+
+            if not credentials_list:
+                logger.error("No valid LinkedIn accounts found in the accounts file")
+                return
+
+            # Determine number of workers (can't exceed number of accounts)
+            num_workers = min(args.num_workers, len(credentials_list))
+            logger.info(f"Using {num_workers} workers with {len(credentials_list)} accounts")
+
+            # Split companies into chunks for each worker
+            companies_list = companies_df.iloc[args.start_index:].to_dict('records')
+            chunk_size = len(companies_list) // num_workers
+            if len(companies_list) % num_workers:
+                chunk_size += 1
+            
+            company_chunks = [
+                companies_list[i:i + chunk_size]
+                for i in range(0, len(companies_list), chunk_size)
+            ]
+
+            # Create worker arguments
+            worker_args = [
+                (chunk, credentials_list[i % len(credentials_list)], dir_prefix_date, args.headless, i)
+                for i, chunk in enumerate(company_chunks)
+            ]
+
+            # Process companies in parallel
+            with multiprocessing.Pool(num_workers) as pool:
+                pool.map(process_companies_chunk, worker_args)
+
         except Exception as e:
             logger.error(f"Error processing companies data file: {str(e)}")
             
     elif args.linkedin_url and args.organization_name:
-        # Process single company
+        # Process single company (non-parallel mode)
+        credentials = LinkedInCredentials(
+            username=os.getenv('LINKEDIN_USERNAME'),
+            password=os.getenv('LINKEDIN_PASSWORD'),
+            auth_file=args.auth_file
+        )
+        scraper = LinkedInJobScraper(credentials)
+        
         base_url = args.linkedin_url.rstrip('/')
         linkedin_jobs_url = f"{base_url}/jobs/"
         jobs = scraper.scrape_company_jobs(linkedin_jobs_url, args.organization_name, dir_prefix_date, args.headless)
