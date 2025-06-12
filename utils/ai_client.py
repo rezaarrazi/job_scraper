@@ -75,7 +75,7 @@ class GeminiProvider(AIProvider):
         self.model = genai.Client(api_key=self.api_key)
     
     def generate_text(self, prompt: str, response_schema: Optional[BaseModel] = None, parse_response: Optional[bool] = False, **kwargs) -> str:
-        model = kwargs.pop("model", "gemini-2.5-flash")
+        model = kwargs.pop("model", "gemini-2.0")
         if response_schema:
             config = kwargs.pop('config', {})
             config['response_schema'] = response_schema
@@ -99,6 +99,17 @@ class GeminiProvider(AIProvider):
             output = response.text
 
         return output
+
+    def generate_embedding(self, text: str, **kwargs) -> List[float]:
+        """Generate embedding using Google's text-embedding model"""
+        model = kwargs.get("model", "text-embedding-004")
+        
+        response = self.model.models.embed_content(
+            model=model,
+            content=text
+        )
+        
+        return response.embedding
 
 class AIClient:
     """Main AI client wrapper that manages different AI providers"""

@@ -12,11 +12,12 @@ from tqdm import tqdm
 from datetime import datetime
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from utils.ai_client import AIClient
 
 load_dotenv()
 
 # --- CONFIG ---
-DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/postgres"
+DATABASE_URL = os.getenv("DATABASE_URL")
 GEMINI_API_KEY = os.getenv("GOOGLE_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
@@ -59,7 +60,7 @@ Write a single, coherent paragraph that starts with the company name. For exampl
 Please provide a clean, professional description based on the input above.
 '''
 
-client = openai.OpenAI(api_key=OPENAI_API_KEY)
+client = AIClient(provider='gemini', api_key=GEMINI_API_KEY)
 engine = create_engine(DATABASE_URL)
 
 @retry(
@@ -71,22 +72,21 @@ engine = create_engine(DATABASE_URL)
 def call_llm(company_text: str) -> Optional[str]:
     """Call LLM to enhance company description"""
     try:
-        client = genai.Client(api_key=GEMINI_API_KEY)
-        
         prompt = COMPANY_DESCRIPTION_PROMPT.format(company_text=company_text)
         
-        response = client.models.generate_content(
-            model='gemini-2.0-flash',
-            contents=[prompt],
+        response = client.generate_text(
+            model='gemini-2.5-flash-preview-05-20',
+            prompt=prompt,
             config={
+                'max_output_tokens': 65535,
                 'temperature': 0.2
             }
         )
         
-        if response.text:
-            return response.text.strip()
+        if response:
+            return response.strip()
         else:
-            error_msg = f"❌ LLM Error: {response.text}"
+            error_msg = f"❌ LLM Error: {response}"
             logger.error(error_msg)
             raise Exception(error_msg)
     except Exception as e:
@@ -131,13 +131,6 @@ def process_company_worker(row: Any) -> Optional[Dict[str, Any]]:
 def populate_enhanced_company_descriptions():
     try:
         with engine.connect() as conn:
-            # First, add the enhancedDescription column if it doesn't exist
-            conn.execute(text("""
-                ALTER TABLE "CompanyScrapingdog" 
-                ADD COLUMN IF NOT EXISTS "enhancedDescription" TEXT
-            """))
-            conn.commit()
-            
             # Get companies that haven't been processed yet
             rows = conn.execute(text("""
                 SELECT 
@@ -153,7 +146,7 @@ def populate_enhanced_company_descriptions():
             logger.debug(f"Found {len(rows)} companies to process")
             
             # Process companies concurrently
-            max_workers = 5  # Number of concurrent workers
+            max_workers = 50  # Number of concurrent workers
             successful_companies = 0
             failed_companies = 0
             

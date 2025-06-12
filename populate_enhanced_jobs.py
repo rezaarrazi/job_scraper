@@ -5,6 +5,8 @@ import pandas as pd
 from sqlalchemy import create_engine, text
 from cuid import cuid
 import json
+import pickle
+from pathlib import Path
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 from utils.logger import setup_logger
@@ -23,9 +25,13 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 load_dotenv()
 
 # --- CONFIG ---
-DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/postgres"
+DATABASE_URL = os.getenv("DATABASE_URL")
 GEMINI_API_KEY = os.getenv("GOOGLE_API_KEY")  # Replace with your actual key
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # Replace with your actual key
+
+# Create backup directory
+BACKUP_DIR = Path("data/backups/enhanced_jobs")
+BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 
 # Setup logger
 logger = setup_logger(__name__, level=logging.DEBUG)
@@ -271,7 +277,14 @@ Input:
 '''
 
 
-engine = create_engine(DATABASE_URL)
+engine = create_engine(
+    DATABASE_URL,
+    pool_size=20,  # Increase base pool size
+    max_overflow=30,  # Increase overflow
+    pool_timeout=60,  # Increase timeout
+    pool_recycle=3600,  # Recycle connections every hour
+    echo=False
+)
 
 gemini_client = AIClient(provider='gemini', api_key=GEMINI_API_KEY)
 openai_client = AIClient(provider='openai', api_key=OPENAI_API_KEY)
@@ -287,7 +300,7 @@ def call_llm(job_text):
         prompt = JOB_EXTRACTION_PROMPT.format(job_text=job_text)
         
         response = gemini_client.generate_text(
-                    model='gemini-2.5-flash',
+                    model='gemini-2.5-flash-preview-05-20',
                     prompt=prompt,
                     response_schema=JobExtraction,
                     config={
@@ -306,7 +319,7 @@ def call_llm(job_text):
 # --- Embedding Helpers ---
 def generate_embedding(text: str):
     try:
-        response = openai_client.generate_embedding(text, model="text-embedding-3-small")
+        response = openai_client.generate_embedding(text, model="text-embedding-ada-002")
         return response
     except Exception as e:
         print(f"❌ Embedding error: {e}")
@@ -357,7 +370,14 @@ def process_skill_embeddings(conn, skills: List[str]) -> Dict[str, List[float]]:
             conn.rollback()
             logger.error(f"❌ Error storing embedding for skill {skill}: {str(e)}")
             
-    return skill_embeddings
+
+    skill_embedding_list = []
+    for skill, embedding in skill_embeddings.items():
+        skill_embedding_list.append({
+            "skill": skill,
+            "embedding": embedding
+        })
+    return skill_embedding_list
 
 def standardize_with_exact_match(value: str, reference_list: list, threshold: int = 80) -> str:
     """
@@ -381,6 +401,7 @@ def standardize_with_exact_match(value: str, reference_list: list, threshold: in
 
 def process_job_worker(row: Any, industries_candidates: List[str], job_titles: List[str], engine) -> Dict[str, Any]:
     """Worker function to process a single job"""
+    connection = None
     try:
         job_raw_id = row.id
         data = row._asdict()
@@ -397,6 +418,8 @@ def process_job_worker(row: Any, industries_candidates: List[str], job_titles: L
             logger.warning(f"⚠️ Skipped due to LLM error for job: {row.jobTitle}")
             return None
         
+        parsed = parsed.model_dump(mode='json')
+
         company_industries = data['company_industry1'] if data['company_industry1'] else data['company_industry2']
 
         if company_industries:
@@ -418,20 +441,20 @@ def process_job_worker(row: Any, industries_candidates: List[str], job_titles: L
         standardized_job_title = standardize_with_exact_match(parsed["simplified_job_title"], job_titles)
         parsed['simplified_job_title_standardized'] = standardized_job_title
 
-        # Process skill embeddings
-        with engine.connect() as conn:
-            required_skills = parsed.get("skills_tag", {}).get("required_skills_tag", [])
-            preferred_skills = parsed.get("skills_tag", {}).get("preferred_skills_tag", [])
-            
-            # Generate embeddings for all skills
-            required_skill_embeddings = process_skill_embeddings(conn, required_skills)
-            preferred_skill_embeddings = process_skill_embeddings(conn, preferred_skills)
-            
-            # Add embeddings to the parsed data
-            parsed['skillEmbeddings'] = {
-                "requiredSkills": {skill: embedding for skill, embedding in required_skill_embeddings.items()},
-                "preferredSkills": {skill: embedding for skill, embedding in preferred_skill_embeddings.items()}
-            }
+        # Process skill embeddings - get a fresh connection for this worker
+        connection = engine.connect()
+        required_skills = parsed.get("skills_tag", {}).get("required_skills_tag", [])
+        preferred_skills = parsed.get("skills_tag", {}).get("preferred_skills_tag", [])
+        
+        # Generate embeddings for all skills
+        required_skill_embeddings = process_skill_embeddings(connection, required_skills)
+        preferred_skill_embeddings = process_skill_embeddings(connection, preferred_skills)
+        
+        # Add embeddings to the parsed data
+        parsed['skillEmbeddings'] = {
+            "requiredSkills": required_skill_embeddings,
+            "preferredSkills": preferred_skill_embeddings
+        }
         
         return {
             "job_raw_id": job_raw_id,
@@ -441,23 +464,59 @@ def process_job_worker(row: Any, industries_candidates: List[str], job_titles: L
     except Exception as e:
         logger.error(f"❌ Error processing job {row.jobTitle}: {str(e)}")
         return None
+    finally:
+        # Ensure connection is properly closed
+        if connection:
+            try:
+                connection.close()
+            except Exception as e:
+                logger.warning(f"⚠️ Error closing connection: {str(e)}")
 
-def populate_enhanced_jobs():
-    try:
-        with engine.connect() as conn:
-            industries_candidates = pd.read_csv(os.path.join(os.getcwd(), 'data/output/industries/unique_industries.csv'))['industry'].tolist()
-            # Load job titles from JSON
-            job_categories_path = os.path.join(os.getcwd(), './data/output/job_category/jobright_job_categories.json')
-            with open(job_categories_path, 'r') as f:
-                job_categories = json.load(f)
+def process_jobs_phase(batch_size: int = 100, max_batches: int = None) -> List[str]:
+    """Phase 1: Process all jobs with LLM in paginated batches and save to backup files"""
+    logger.info("🚀 Starting Phase 1: Paginated Job Processing")
+    
+    all_batch_ids = []
+    current_page = 0
+    total_processed = 0
+    total_failed = 0
+    
+    with engine.connect() as conn:
+        industries_candidates = pd.read_csv(os.path.join(os.getcwd(), 'data/output/industries/unique_industries.csv'))['industry'].tolist()
+        # Load job titles from JSON
+        job_categories_path = os.path.join(os.getcwd(), './data/output/job_category/jobright_job_categories.json')
+        with open(job_categories_path, 'r') as f:
+            job_categories = json.load(f)
+        
+        # Extract all job titles into a flat list
+        job_titles = []
+        for category in job_categories.values():
+            for subcategory in category.values():
+                job_titles.extend(subcategory)
+
+        # First, get total count of unprocessed jobs
+        total_unprocessed = conn.execute(text("""
+            SELECT COUNT(*) 
+            FROM "JobRaw" jr
+            LEFT JOIN "Company" c ON jr."companyId" = c."id"
+            LEFT JOIN "EnhancedJobDetail" ejd ON jr."id" = ejd."jobRawId"
+            WHERE ejd."id" IS NULL and c."id" IS NOT NULL
+        """)).scalar()
+        
+        logger.info(f"📊 Total unprocessed jobs: {total_unprocessed}")
+        logger.info(f"📄 Processing in batches of {batch_size}")
+        
+        if max_batches:
+            logger.info(f"🔒 Limited to maximum {max_batches} batches")
             
-            # Extract all job titles into a flat list
-            job_titles = []
-            for category in job_categories.values():
-                for subcategory in category.values():
-                    job_titles.extend(subcategory)
-
-            # Get jobs that haven't been processed yet
+        while True:
+            # Check if we've hit the max_batches limit
+            if max_batches and current_page >= max_batches:
+                logger.info(f"🔒 Reached maximum batch limit ({max_batches})")
+                break
+                
+            # Get next batch of jobs with pagination
+            offset = current_page * batch_size
             rows = conn.execute(text("""
                 SELECT 
                     jr.*,
@@ -475,13 +534,21 @@ def populate_enhanced_jobs():
                 LEFT JOIN "CompanyScrapingdog" csd ON c."id" = csd."companyId"
                 LEFT JOIN "EnhancedJobDetail" ejd ON jr."id" = ejd."jobRawId"
                 WHERE ejd."id" IS NULL and c."id" IS NOT NULL
-            """)).fetchall()
+                ORDER BY jr."id"
+                LIMIT :batch_size OFFSET :offset
+            """), {"batch_size": batch_size, "offset": offset}).fetchall()
+            
+            # If no more jobs, we're done
+            if not rows:
+                logger.info("✅ No more jobs to process")
+                break
+                
+            current_page += 1
+            logger.info(f"📄 Processing batch {current_page} - Jobs {offset + 1} to {offset + len(rows)} ({len(rows)} jobs)")
 
-            logger.debug(f"Found {len(rows)} jobs to process")
-
-            # Process jobs concurrently
-            max_workers = 10
-            successful_jobs = 0
+            # Process jobs concurrently (LLM processing only)
+            max_workers = 3  # Conservative for bandwidth management
+            processed_jobs = []
             failed_jobs = 0
 
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -491,114 +558,18 @@ def populate_enhanced_jobs():
                         process_job_worker,
                         row,
                         industries_candidates,
-                        job_titles,
-                        engine
+                        job_titles
                     ): row for row in rows
                 }
 
-                # Create progress bar
-                with tqdm(total=len(rows), desc="Processing jobs", unit="job") as pbar:
+                # Create progress bar for this batch
+                with tqdm(total=len(rows), desc=f"🧠 Batch {current_page} LLM Processing", unit="job") as pbar:
                     for future in as_completed(futures):
                         row = futures[future]
                         try:
                             result = future.result()
                             if result:
-                                # Insert the processed job into the database
-                                try:
-                                    conn.execute(text("""
-                                        INSERT INTO "EnhancedJobDetail" (
-                                            "id", "jobTitle", "simplifiedJobTitle", "simplifiedJobTitleStandardized",
-                                            "companyName", "companyLogoUrl", "companyIndustries", "companyType", "companyDescription", "contractType",
-                                            "location", "experienceLevel", "minExperience", "maxExperience",
-                                            "description", "responsibilities", "requiredProfile", "preferredProfile",
-                                            "skillsTag", "skillEmbeddings", "techStack", "languageRequirements", "benefits", "salaryRange",
-                                            "workArrangement", "linkedinJobUrl", "url", "minimumEducationLevel",
-                                            "isExternal", "jobRawId", "companyId", "createdAt", "updatedAt"
-                                        ) VALUES (
-                                            COALESCE((SELECT "id" FROM "EnhancedJobDetail" WHERE "jobRawId" = :jobRawId), :id),
-                                            :jobTitle, :simplifiedJobTitle, :simplifiedJobTitleStandardized,
-                                            :companyName, :companyLogoUrl, :companyIndustries, :companyType, :companyDescription, :contractType,
-                                            :location, :experienceLevel, :minExperience, :maxExperience,
-                                            :description, :responsibilities, :requiredProfile, :preferredProfile,
-                                            :skillsTag, :skillEmbeddings, :techStack, :languageRequirements, :benefits, :salaryRange,
-                                            :workArrangement, :linkedinJobUrl, :url, :minimumEducationLevel,
-                                            :isExternal, :jobRawId, :companyId,
-                                            COALESCE((SELECT "createdAt" FROM "EnhancedJobDetail" WHERE "jobRawId" = :jobRawId), now()),
-                                            now()
-                                        )
-                                        ON CONFLICT ("jobRawId") DO UPDATE SET
-                                            "jobTitle" = EXCLUDED."jobTitle",
-                                            "simplifiedJobTitle" = EXCLUDED."simplifiedJobTitle",
-                                            "simplifiedJobTitleStandardized" = EXCLUDED."simplifiedJobTitleStandardized",
-                                            "companyName" = EXCLUDED."companyName",
-                                            "companyLogoUrl" = EXCLUDED."companyLogoUrl",
-                                            "companyIndustries" = EXCLUDED."companyIndustries",
-                                            "companyType" = EXCLUDED."companyType",
-                                            "companyDescription" = EXCLUDED."companyDescription",
-                                            "contractType" = EXCLUDED."contractType",
-                                            "location" = EXCLUDED."location",
-                                            "experienceLevel" = EXCLUDED."experienceLevel",
-                                            "minExperience" = EXCLUDED."minExperience",
-                                            "maxExperience" = EXCLUDED."maxExperience",
-                                            "description" = EXCLUDED."description",
-                                            "responsibilities" = EXCLUDED."responsibilities",
-                                            "requiredProfile" = EXCLUDED."requiredProfile",
-                                            "preferredProfile" = EXCLUDED."preferredProfile",
-                                            "skillsTag" = EXCLUDED."skillsTag",
-                                            "skillEmbeddings" = EXCLUDED."skillEmbeddings",
-                                            "techStack" = EXCLUDED."techStack",
-                                            "languageRequirements" = EXCLUDED."languageRequirements",
-                                            "benefits" = EXCLUDED."benefits",
-                                            "salaryRange" = EXCLUDED."salaryRange",
-                                            "workArrangement" = EXCLUDED."workArrangement",
-                                            "linkedinJobUrl" = EXCLUDED."linkedinJobUrl",
-                                            "url" = EXCLUDED."url",
-                                            "minimumEducationLevel" = EXCLUDED."minimumEducationLevel",
-                                            "isExternal" = EXCLUDED."isExternal",
-                                            "companyId" = EXCLUDED."companyId",
-                                            "updatedAt" = now()
-                                    """), {
-                                        "id": cuid(),
-                                        "jobTitle": result["parsed"].get("job_title"),
-                                        "simplifiedJobTitle": result["parsed"].get("simplified_job_title"),
-                                        "simplifiedJobTitleStandardized": result["parsed"].get("simplified_job_title_standardized"),
-                                        "companyName": result["parsed"].get("company_name"),
-                                        "companyLogoUrl": result["data"]["company_logo_url"],
-                                        "companyIndustries": result["parsed"].get("company_industries") or [],
-                                        "companyType": result["data"]["company_type"],
-                                        "companyDescription": result["data"]["company_enhanced_description"],
-                                        "contractType": result["parsed"].get("contract_type"),
-                                        "location": result["parsed"].get("location"),
-                                        "experienceLevel": result["parsed"].get("experience_level"),
-                                        "minExperience": result["parsed"].get("min_experience"),
-                                        "maxExperience": result["parsed"].get("max_experience"),
-                                        "description": result["parsed"].get("description"),
-                                        "responsibilities": result["parsed"].get("responsibilities") or [],
-                                        "requiredProfile": result["parsed"].get("required_profile") or [],
-                                        "preferredProfile": result["parsed"].get("preferred_profile") or [],
-                                        "skillsTag": json.dumps({
-                                            "requiredSkillsTag": result["parsed"].get("skills_tag", {}).get("required_skills_tag", []),
-                                            "preferredSkillsTag": result["parsed"].get("skills_tag", {}).get("preferred_skills_tag", [])
-                                        }),
-                                        "skillEmbeddings": json.dumps(result["parsed"].get("skillEmbeddings", {})),
-                                        "techStack": result["parsed"].get("tech_stack") or [],
-                                        "languageRequirements": result["parsed"].get("language_requirements") or [],
-                                        "benefits": result["parsed"].get("benefits") or [],
-                                        "salaryRange": result["parsed"].get("salary_range"),
-                                        "workArrangement": result["parsed"].get("work_arrangement"),
-                                        "linkedinJobUrl": result["parsed"].get("linkedin_job_url"),
-                                        "url": result["parsed"].get("url"),
-                                        "minimumEducationLevel": result["parsed"].get("minimum_education_level"),
-                                        "isExternal": False,
-                                        "jobRawId": result["job_raw_id"],
-                                        "companyId": result["data"]["companyId"]
-                                    })
-                                    conn.commit()
-                                    successful_jobs += 1
-                                except Exception as e:
-                                    conn.rollback()
-                                    logger.error(f"❌ Error inserting job {result['parsed'].get('job_title')}: {str(e)}")
-                                    failed_jobs += 1
+                                processed_jobs.append(result)
                             else:
                                 failed_jobs += 1
                         except Exception as e:
@@ -607,15 +578,338 @@ def populate_enhanced_jobs():
                         finally:
                             pbar.update(1)
                             pbar.set_postfix(
-                                successful=successful_jobs,
+                                processed=len(processed_jobs),
                                 failed=failed_jobs
                             )
 
-            logger.info(f"✅ Processing complete. Successful: {successful_jobs}, Failed: {failed_jobs}")
+            # Save processed data to backup files for this batch
+            if processed_jobs:
+                batch_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                batch_id = f"{batch_timestamp}_batch_{current_page:03d}"
+                backup_info = save_processed_data(processed_jobs, batch_id)
+                all_batch_ids.append(batch_id)
+                
+                total_processed += len(processed_jobs)
+                total_failed += failed_jobs
+                
+                logger.info(f"✅ Batch {current_page} complete! Processed: {len(processed_jobs)}, Failed: {failed_jobs}")
+                logger.info(f"📁 Batch saved with ID: {batch_id}")
+                logger.info(f"📊 Progress: {total_processed}/{total_unprocessed} total processed ({total_processed/total_unprocessed*100:.1f}%)")
+                
+                # Brief pause between batches to manage bandwidth
+                time.sleep(2)
+            else:
+                logger.warning(f"⚠️ Batch {current_page}: No jobs were successfully processed")
+                total_failed += failed_jobs
 
+        # Summary
+        logger.info(f"🎉 Phase 1 Complete!")
+        logger.info(f"📊 Total batches processed: {len(all_batch_ids)}")
+        logger.info(f"📊 Total jobs processed: {total_processed}")
+        logger.info(f"📊 Total jobs failed: {total_failed}")
+        logger.info(f"📁 Batch IDs: {all_batch_ids}")
+        
+        return all_batch_ids
+
+def ingest_jobs_phase(batch_ids: List[str] = None, batch_id: str = None, from_backup: bool = False) -> tuple:
+    """Phase 2: Ingest processed jobs to database (supports single batch or multiple batches)"""
+    logger.info("🚀 Starting Phase 2: Database Ingestion")
+    
+    # Handle different input formats
+    if batch_id and not batch_ids:
+        batch_ids = [batch_id]
+    elif not batch_ids and not batch_id:
+        logger.error("❌ No batch_id or batch_ids provided for ingestion phase")
+        return 0, 0
+    
+    total_successful = 0
+    total_failed = 0
+    
+    for i, current_batch_id in enumerate(batch_ids, 1):
+        logger.info(f"📦 Processing batch {i}/{len(batch_ids)}: {current_batch_id}")
+        
+        try:
+            # Load from backup
+            processed_jobs = load_processed_data(current_batch_id)
+            
+            # Ingest to database
+            successful_jobs, failed_jobs = ingest_to_database(processed_jobs, engine)
+            
+            total_successful += successful_jobs
+            total_failed += failed_jobs
+            
+            logger.info(f"✅ Batch {current_batch_id} complete! Successful: {successful_jobs}, Failed: {failed_jobs}")
+            
+            # Brief pause between batches
+            if i < len(batch_ids):
+                logger.info("⏳ Brief pause before next batch...")
+                time.sleep(3)
+                
+        except Exception as e:
+            logger.error(f"❌ Error processing batch {current_batch_id}: {str(e)}")
+            continue
+    
+    logger.info(f"✅ Phase 2 Complete! Total - Successful: {total_successful}, Failed: {total_failed}")
+    return total_successful, total_failed
+
+def ingest_all_batches() -> tuple:
+    """Ingest all available backup batches"""
+    logger.info("🔍 Searching for all available backup batches...")
+    
+    # Find all backup files
+    backup_files = list(BACKUP_DIR.glob("enhanced_jobs_raw_*.pkl"))
+    
+    if not backup_files:
+        logger.warning("⚠️ No backup files found")
+        return 0, 0
+    
+    # Extract batch IDs from filenames
+    batch_ids = []
+    for file_path in backup_files:
+        # Extract batch_id from filename like "enhanced_jobs_raw_20250603_172230_batch_001.pkl"
+        filename = file_path.stem
+        if filename.startswith("enhanced_jobs_raw_"):
+            batch_id = filename[len("enhanced_jobs_raw_"):]
+            batch_ids.append(batch_id)
+    
+    batch_ids.sort()  # Process in chronological order
+    logger.info(f"📁 Found {len(batch_ids)} batches: {batch_ids}")
+    
+    return ingest_jobs_phase(batch_ids=batch_ids, from_backup=True)
+
+def list_available_batches():
+    """List all available backup batches with details"""
+    logger.info("📋 Available backup batches:")
+    
+    backup_files = list(BACKUP_DIR.glob("enhanced_jobs_raw_*.pkl"))
+    
+    if not backup_files:
+        logger.info("   No backup files found")
+        return []
+    
+    batch_info = []
+    for file_path in backup_files:
+        try:
+            # Get file stats
+            stat = file_path.stat()
+            size_mb = stat.st_size / (1024 * 1024)
+            modified = datetime.fromtimestamp(stat.st_mtime)
+            
+            # Extract batch_id
+            filename = file_path.stem
+            if filename.startswith("enhanced_jobs_raw_"):
+                batch_id = filename[len("enhanced_jobs_raw_"):]
+                
+                # Try to load and get job count
+                try:
+                    with open(file_path, 'rb') as f:
+                        jobs = pickle.load(f)
+                    job_count = len(jobs)
+                except:
+                    job_count = "Unknown"
+                
+                batch_info.append({
+                    "batch_id": batch_id,
+                    "job_count": job_count,
+                    "size_mb": size_mb,
+                    "created": modified,
+                    "file_path": file_path
+                })
+                
+                logger.info(f"   {batch_id}: {job_count} jobs, {size_mb:.1f}MB, created {modified.strftime('%Y-%m-%d %H:%M:%S')}")
+        except Exception as e:
+            logger.warning(f"   Error reading {file_path}: {e}")
+    
+    return batch_info
+
+def save_processed_data(processed_jobs: List[Dict], batch_id: str = None):
+    """Save processed job data to backup files"""
+    if not batch_id:
+        batch_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Create DataFrames for different data types
+    main_data = []
+    embeddings_data = []
+    
+    for job in processed_jobs:
+        # Main job data
+        main_record = {
+            "job_raw_id": job["job_raw_id"],
+            "jobTitle": job["parsed"].get("job_title"),
+            "simplifiedJobTitle": job["parsed"].get("simplified_job_title"),
+            "simplifiedJobTitleStandardized": job["parsed"].get("simplified_job_title_standardized"),
+            "companyName": job["parsed"].get("company_name"),
+            "companyLogoUrl": job["data"]["company_logo_url"],
+            "companyIndustries": json.dumps(job["parsed"].get("company_industries", [])),
+            "companyType": job["data"]["company_type"],
+            "companyDescription": job["data"]["company_enhanced_description"],
+            "contractType": job["parsed"].get("contract_type"),
+            "location": job["parsed"].get("location"),
+            "experienceLevel": job["parsed"].get("experience_level"),
+            "minExperience": job["parsed"].get("min_experience"),
+            "maxExperience": job["parsed"].get("max_experience"),
+            "description": job["parsed"].get("description"),
+            "responsibilities": json.dumps(job["parsed"].get("responsibilities", [])),
+            "requiredProfile": json.dumps(job["parsed"].get("required_profile", [])),
+            "preferredProfile": json.dumps(job["parsed"].get("preferred_profile", [])),
+            "skillsTag": json.dumps({
+                "requiredSkillsTag": job["parsed"].get("skills_tag", {}).get("required_skills_tag", []),
+                "preferredSkillsTag": job["parsed"].get("skills_tag", {}).get("preferred_skills_tag", [])
+            }),
+            "techStack": json.dumps(job["parsed"].get("tech_stack", [])),
+            "languageRequirements": json.dumps(job["parsed"].get("language_requirements", [])),
+            "benefits": json.dumps(job["parsed"].get("benefits", [])),
+            "salaryRange": job["parsed"].get("salary_range"),
+            "workArrangement": job["parsed"].get("work_arrangement"),
+            "linkedinJobUrl": job["parsed"].get("linkedin_job_url"),
+            "url": job["parsed"].get("url"),
+            "minimumEducationLevel": job["parsed"].get("minimum_education_level"),
+            "isExternal": False,
+            "companyId": job["data"]["companyId"]
+        }
+        main_data.append(main_record)
+        
+        # Skill embeddings data (if exists)
+        if "skillEmbeddings" in job["parsed"]:
+            embeddings_data.append({
+                "job_raw_id": job["job_raw_id"],
+                "skillEmbeddings": json.dumps(job["parsed"]["skillEmbeddings"])
+            })
+    
+    # Save to multiple formats for redundancy
+    main_df = pd.DataFrame(main_data)
+    embeddings_df = pd.DataFrame(embeddings_data) if embeddings_data else pd.DataFrame()
+    
+    # Save as CSV
+    main_csv_path = BACKUP_DIR / f"enhanced_jobs_main_{batch_id}.csv"
+    main_df.to_csv(main_csv_path, index=False)
+    logger.info(f"💾 Saved main data to: {main_csv_path}")
+    
+    if not embeddings_df.empty:
+        embeddings_csv_path = BACKUP_DIR / f"enhanced_jobs_embeddings_{batch_id}.csv"
+        embeddings_df.to_csv(embeddings_csv_path, index=False)
+        logger.info(f"💾 Saved embeddings data to: {embeddings_csv_path}")
+    
+    # Save raw processed data as pickle for exact recovery
+    pickle_path = BACKUP_DIR / f"enhanced_jobs_raw_{batch_id}.pkl"
+    with open(pickle_path, 'wb') as f:
+        pickle.dump(processed_jobs, f)
+    logger.info(f"💾 Saved raw data to: {pickle_path}")
+    
+    return {
+        "batch_id": batch_id,
+        "main_csv": main_csv_path,
+        "embeddings_csv": embeddings_csv_path if not embeddings_df.empty else None,
+        "pickle": pickle_path,
+        "job_count": len(processed_jobs)
+    }
+
+def load_processed_data(batch_id: str) -> List[Dict]:
+    """Load processed job data from backup files"""
+    pickle_path = BACKUP_DIR / f"enhanced_jobs_raw_{batch_id}.pkl"
+    
+    if not pickle_path.exists():
+        raise FileNotFoundError(f"Backup file not found: {pickle_path}")
+    
+    with open(pickle_path, 'rb') as f:
+        processed_jobs = pickle.load(f)
+    
+    logger.info(f"📥 Loaded {len(processed_jobs)} jobs from backup: {pickle_path}")
+    return processed_jobs
+
+def populate_enhanced_jobs(mode: str = "full", batch_size: int = 100, batch_id: str = None, max_batches: int = None):
+    """
+    Main function with different modes:
+    - 'full': Run both processing and ingestion phases
+    - 'process': Run only processing phase (all jobs, paginated)
+    - 'ingest': Run only ingestion phase (requires batch_id)
+    - 'ingest-all': Ingest all available backup batches
+    - 'list': List all available backup batches
+    """
+    try:
+        if mode == "full":
+            # Run both phases
+            logger.info("🎯 Running FULL mode: Processing + Ingestion")
+            batch_ids = process_jobs_phase(batch_size, max_batches)
+            if batch_ids:
+                successful_jobs, failed_jobs = ingest_jobs_phase(batch_ids=batch_ids)
+                logger.info(f"🎉 FULL mode complete! Batches: {len(batch_ids)}, Success: {successful_jobs}, Failed: {failed_jobs}")
+            else:
+                logger.error("❌ Processing phase failed, skipping ingestion")
+                
+        elif mode == "process":
+            # Run only processing phase (all jobs, paginated)
+            logger.info("🧠 Running PROCESS mode: Paginated LLM Processing")
+            if max_batches:
+                logger.info(f"🔒 Limited to {max_batches} batches")
+            batch_ids = process_jobs_phase(batch_size, max_batches)
+            if batch_ids:
+                logger.info(f"🎉 PROCESS mode complete! Created {len(batch_ids)} batches")
+                logger.info(f"📋 Batch IDs: {batch_ids}")
+                logger.info(f"📋 To ingest all batches, run: populate_enhanced_jobs(mode='ingest-all')")
+                logger.info(f"📋 To ingest specific batch, run: populate_enhanced_jobs(mode='ingest', batch_id='{batch_ids[0]}')")
+            else:
+                logger.error("❌ Processing phase failed")
+                
+        elif mode == "ingest":
+            # Run only ingestion phase
+            if not batch_id:
+                logger.error("❌ INGEST mode requires batch_id parameter")
+                return
+            logger.info(f"💾 Running INGEST mode: Database ingestion for batch {batch_id}")
+            successful_jobs, failed_jobs = ingest_jobs_phase(batch_id=batch_id, from_backup=True)
+            logger.info(f"🎉 INGEST mode complete! Success: {successful_jobs}, Failed: {failed_jobs}")
+            
+        elif mode == "ingest-all":
+            # Ingest all available backup batches
+            logger.info("💾 Running INGEST-ALL mode: Database ingestion for all backup batches")
+            successful_jobs, failed_jobs = ingest_all_batches()
+            logger.info(f"🎉 INGEST-ALL mode complete! Success: {successful_jobs}, Failed: {failed_jobs}")
+            
+        elif mode == "list":
+            # List all available backup batches
+            logger.info("📋 Running LIST mode: Show all backup batches")
+            batch_info = list_available_batches()
+            if batch_info:
+                logger.info(f"📊 Found {len(batch_info)} backup batches")
+                total_jobs = sum(info['job_count'] for info in batch_info if isinstance(info['job_count'], int))
+                total_size = sum(info['size_mb'] for info in batch_info)
+                logger.info(f"📊 Total jobs in backups: {total_jobs}")
+                logger.info(f"📊 Total backup size: {total_size:.1f}MB")
+            else:
+                logger.info("📊 No backup batches found")
+            
+        else:
+            logger.error(f"❌ Invalid mode: {mode}. Use 'full', 'process', 'ingest', 'ingest-all', or 'list'")
+            
     except Exception as e:
         logger.error(f"❌ Fatal error: {str(e)}")
         raise
 
 if __name__ == "__main__":
-    populate_enhanced_jobs()
+    import sys
+    
+    # Example usage with command line arguments
+    if len(sys.argv) > 1:
+        mode = sys.argv[1]
+        batch_size = int(sys.argv[2]) if len(sys.argv) > 2 else 100
+        batch_id = sys.argv[3] if len(sys.argv) > 3 else None
+        max_batches = int(sys.argv[4]) if len(sys.argv) > 4 else None
+        
+        populate_enhanced_jobs(mode=mode, batch_size=batch_size, batch_id=batch_id, max_batches=max_batches)
+    else:
+        # Default: run processing only (safer for bandwidth)
+        print("🚀 Running in PROCESS mode (safer for bandwidth limits)")
+        print("📝 Usage examples:")
+        print("  python populate_enhanced_jobs.py process 50                    # Process all jobs in batches of 50")
+        print("  python populate_enhanced_jobs.py process 100 20240603 2       # Process 2 batches of 100 jobs")
+        print("  python populate_enhanced_jobs.py ingest <batch_id>             # Ingest specific batch")
+        print("  python populate_enhanced_jobs.py ingest-all                    # Ingest all backup batches")
+        print("  python populate_enhanced_jobs.py list                          # List all backup batches")
+        print("  python populate_enhanced_jobs.py full 100                      # Process and ingest all jobs")
+        print()
+        print("🔍 First, let's see what backup batches exist:")
+        list_available_batches()
+        print()
+        
+        populate_enhanced_jobs(mode="process", batch_size=50, max_batches=2)  # Start with small test

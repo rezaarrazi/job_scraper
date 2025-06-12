@@ -1,7 +1,11 @@
+import os
 import pandas as pd
 from sqlalchemy import create_engine, text
 from cuid import cuid
 import argparse
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Parse command line arguments
 parser = argparse.ArgumentParser(description='Import companies from CSV to database')
@@ -12,8 +16,8 @@ args = parser.parse_args()
 df = pd.read_csv(args.file_path)
 print(df.head())
 
-# Setup DB connection
-DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/postgres"  # adjust based on your setup
+# Setup DB connection - Updated for Supabase
+DATABASE_URL = os.getenv("DATABASE_URL")
 engine = create_engine(DATABASE_URL)
 
 def safe_date(val):

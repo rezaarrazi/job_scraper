@@ -101,35 +101,36 @@ def import_scrapingdog_data(data_source="api", csv_path=None):
                 return
                 
             try:
+                # Load CSV data into dataframe
                 df = pd.read_csv(csv_path)
                 logger.info(f"Loaded {len(df)} records from CSV file")
-                pbar = tqdm(df.iterrows(), total=len(df), desc="📄 Processing CSV data")
                 
-                for _, row in pbar:
-                    name = row.get('companyName', '')
+                # First, get all companies that don't have ScrapingDog data
+                companies = conn.execute(text("""
+                    SELECT c.id, c."linkedin", c."organizationName"
+                    FROM "Company" c
+                    LEFT JOIN "CompanyScrapingdog" s ON s."companyId" = c.id
+                    WHERE c."linkedin" IS NOT NULL AND s."id" IS NULL
+                """)).fetchall()
+                
+                logger.info(f"Found {len(companies)} companies needing ScrapingDog data")
+                pbar = tqdm(companies, desc="📄 Processing companies from CSV")
+                
+                for company_id, linkedin, name in pbar:
                     pbar.set_description(f"📄 {name}")
-
-                    linkedin = "https://www.linkedin.com/company/" + row.get('universalNameId', '')
                     
-                    # Find company by organization name
-                    company_result = conn.execute(text("""
-                        SELECT id FROM "Company" WHERE "linkedin" LIKE '%' || :linkedin || '%'
-                    """), {"linkedin": linkedin}).fetchone()
+                    # Extract universalNameId from linkedin URL
+                    universal_name_id = linkedin.strip("/").split("/")[-1]
                     
-                    if not company_result:
-                        logger.warning(f"⚠️ Skipping {name}, organization name not found in database")
+                    # Find matching record in CSV by universalNameId
+                    matching_rows = df[df['universalNameId'] == universal_name_id]
+                    
+                    if matching_rows.empty:
+                        logger.warning(f"⚠️ Skipping {name}, no matching record found in CSV. {universal_name_id}, {linkedin}")
                         continue
-                        
-                    company_id = company_result[0]
                     
-                    # Check if data already exists for this company
-                    data_exists = conn.execute(text("""
-                        SELECT id FROM "CompanyScrapingdog" WHERE "companyId" = :id
-                    """), {"id": company_id}).fetchone()
-                    
-                    if data_exists:
-                        logger.warning(f"⚠️ Skipping {name}, data already exists")
-                        continue
+                    # Use the first matching row
+                    row = matching_rows.iloc[0]
                     
                     # Convert row to dict and map CSV columns to expected JSON structure
                     row_dict = row.to_dict()
@@ -143,6 +144,7 @@ def import_scrapingdog_data(data_source="api", csv_path=None):
                     data['linkedinUrl'] = linkedin
                     
                     insert_company_data(conn, company_id, data, name)
+                    
             except Exception as e:
                 logger.error(f"❌ Failed to process CSV file: {str(e)}")
                 return

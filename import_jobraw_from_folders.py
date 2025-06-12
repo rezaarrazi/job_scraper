@@ -3,10 +3,13 @@ import pandas as pd
 from sqlalchemy import create_engine, text
 from cuid import cuid
 from tqdm import tqdm
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # --- CONFIG ---
-DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/postgres"
-DATA_DIR = "data/output/20250408_022611"
+DATABASE_URL = os.getenv("DATABASE_URL")
+DATA_DIR = "data/output/20250528_043403"
 
 # --- Connect DB ---
 engine = create_engine(DATABASE_URL)
