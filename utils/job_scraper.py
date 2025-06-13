@@ -400,7 +400,13 @@ class LinkedInJobScraper:
                 if page.locator(empty_jobs_selector).count() > 0:
                     logger.info(f"[Worker {self.worker_id}] No jobs available for this company")
                     return []
-                self.click_show_all_jobs(page)
+                
+                try:
+                    self.click_show_all_jobs(page)
+                except Exception as e:
+                    logger.error(f"[Worker {self.worker_id}] No jobs available for this company")
+                    return []
+                
                 self.wait_for_job_listings(page)
                 results_count = self.get_results_count(page)
                 logger.info(f"[Worker {self.worker_id}] Found {results_count} job listings")
