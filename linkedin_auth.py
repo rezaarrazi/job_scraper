@@ -29,7 +29,7 @@ def authenticate_linkedin():
             page.click('button[type="submit"]')
             
             # Wait for navigation to complete and verify we're logged in
-            page.wait_for_url('https://www.linkedin.com/feed/')
+            page.wait_for_url('https://www.linkedin.com/feed/', timeout=50000)
             
             # Save storage state
             context.storage_state(path=auth_file)

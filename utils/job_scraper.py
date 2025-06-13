@@ -2,7 +2,7 @@ import os
 import csv
 from datetime import datetime
 import json
-from typing import List, Dict, Callable
+from typing import List, Dict, Callable, Set
 from utils.logger import setup_logger
 from functools import wraps
 from dataclasses import dataclass
@@ -12,40 +12,24 @@ from dotenv import load_dotenv
 
 # Fieldnames for CSV writing
 fieldnames = [
-    'linkedin_job_url', 'job_id', 'job_title', 'company_name', 'location',
-    'posted_date', 'is_active', 'work_arrangement', 'contract_type',
-    'seniority_level', 'company_apply_url', 'description'
+    'id', 'linkedinJobUrl', 'jobId', 'jobTitle', 'companyName', 'location',
+    'postedDate', 'workArrangement', 'contractType', 'seniorityLevel',
+    'companyApplyUrl', 'description', 'companyId'
 ]
 
 logger = setup_logger(__name__)
 
 load_dotenv()
 
-def create_supabase_client():
-    """Create Supabase client with appropriate key from environment variables."""
-    supabase_url = os.getenv("SUPABASE_URL")
-    service_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-    anon_key = os.getenv("SUPABASE_ANON_KEY")
-    if service_key:
-        return create_client(supabase_url, service_key)
-    elif anon_key:
-        return create_client(supabase_url, anon_key)
-    else:
-        raise ValueError("Either SUPABASE_SERVICE_ROLE_KEY or SUPABASE_ANON_KEY environment variable is required")
-
-supabase: Client = create_supabase_client()
-
-def job_id_exists_in_supabase(job_id: str) -> bool:
-    """
-    Check if a job_id already exists in the JobRaw table in Supabase.
-    Returns True if exists, False otherwise.
-    """
-    try:
-        response = supabase.table("JobRaw").select("jobId").eq("jobId", job_id).limit(1).execute()
-        return bool(response.data)
-    except Exception as e:
-        logger.error(f"Error checking job_id {job_id} in Supabase: {str(e)}")
-        return False
+def create_supabase_client(supabase_url: str = None, supabase_key: str = None):
+    """Create Supabase client with provided URL and key, or from environment variables if not provided."""
+    if not supabase_url:
+        supabase_url = os.getenv("SUPABASE_URL")
+    if not supabase_key:
+        supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_ANON_KEY")
+    if not supabase_url or not supabase_key:
+        raise ValueError("SUPABASE_URL and a Supabase key are required.")
+    return create_client(supabase_url, supabase_key)
 
 def retry_on_failure(max_retries: int = 3, delay: float = 2.0, backoff: float = 2.0):
     """
@@ -76,7 +60,7 @@ def retry_on_failure(max_retries: int = 3, delay: float = 2.0, backoff: float = 
         return wrapper
     return decorator
 
-def safe_html_content(page, prefix: str = "page", html_dir: str = "job_pages"):
+def save_html_content(page, prefix: str = "page", html_dir: str = "job_pages"):
     """
     Save the HTML content of a page to a file.
     Args:
@@ -168,16 +152,25 @@ class LinkedInCredentials:
     auth_file: str
 
 class LinkedInJobScraper:
-    def __init__(self, credentials: LinkedInCredentials, worker_id: int = 0):
-        """Initialize the scraper with credentials and worker ID."""
+    def __init__(self, credentials: LinkedInCredentials, worker_id: int = 0, supabase_client: Client = None):
+        """Initialize the scraper with credentials, worker ID, and optional Supabase client."""
         self.credentials = credentials
         self.worker_id = worker_id
-        self.auth_file = os.path.join(
-            os.path.dirname(__file__),
-            '.auth',
-            credentials.auth_file
-        )
+        self.auth_file = credentials.auth_file
+        self.supabase = supabase_client if supabase_client is not None else create_supabase_client()
         logger.info(f"[Worker {self.worker_id}] Using authentication file: {self.auth_file}")
+
+    def job_id_exists_in_supabase(self, job_id: str) -> bool:
+        """
+        Check if a job_id already exists in the JobRaw table in Supabase.
+        Returns True if exists, False otherwise.
+        """
+        try:
+            response = self.supabase.table("JobRaw").select("jobId").eq("jobId", job_id).limit(1).execute()
+            return bool(response.data)
+        except Exception as e:
+            logger.error(f"[Worker {self.worker_id}] Error checking job_id {job_id} in Supabase: {str(e)}")
+            return False
 
     def safe_html_content(self, page):
         """Save the HTML content of a page to a file."""
@@ -263,7 +256,7 @@ class LinkedInJobScraper:
             logger.error(f"[Worker {self.worker_id}] Error clicking 'Show all jobs': {str(e)}")
             raise e
 
-    def scroll_to_bottom(self, page):
+    def scroll_to_bottom(self, page, max_scrolls: int = 7):
         """Scroll to the bottom of the page."""
         scrollable_container = page.evaluate('''() => {
             const listElement = document.querySelector('.scaffold-layout__list');
@@ -275,11 +268,7 @@ class LinkedInJobScraper:
             return scrollableDiv.className.split(' ')[0];
         }''')
         if scrollable_container:
-            last_height = page.evaluate('''(selector) => {
-                const element = document.querySelector(selector);
-                return element ? element.scrollHeight : 0;
-            }''', f'.{scrollable_container}')
-            while True:
+            for _ in range(max_scrolls):
                 page.evaluate('''(selector) => {
                     const element = document.querySelector(selector);
                     if (element) {
@@ -287,13 +276,6 @@ class LinkedInJobScraper:
                     }
                 }''', f'.{scrollable_container}')
                 page.wait_for_timeout(1000)
-                new_height = page.evaluate('''(selector) => {
-                    const element = document.querySelector(selector);
-                    return element ? element.scrollHeight : 0;
-                }''', f'.{scrollable_container}')
-                if new_height == last_height:
-                    break
-                last_height = new_height
 
     @retry_on_failure(max_retries=3, delay=1.0)
     def navigate_to_next_page(self, page):
@@ -374,6 +356,18 @@ class LinkedInJobScraper:
             logger.error(f"[Worker {self.worker_id}] Error extracting job data from code tag: {str(e)}")
         return details
 
+    def get_existing_job_ids_for_company(self, company_name: str) -> Set[str]:
+        """
+        Fetch all jobIds for the given company_name from Supabase JobRaw table.
+        Returns a set of jobIds (as strings).
+        """
+        try:
+            response = self.supabase.table("JobRaw").select("jobId").eq("companyName", company_name).execute()
+            return set(str(row["jobId"]) for row in response.data if row.get("jobId"))
+        except Exception as e:
+            logger.error(f"[Worker {self.worker_id}] Error fetching jobIds for company {company_name} from Supabase: {str(e)}")
+            return set()
+
     def scrape_company_jobs(self, company_url: str, organization_name: str, dir_prefix_date: str, headless: bool = True) -> List[Dict]:
         """
         Scrape all job listings from a company's LinkedIn jobs page.
@@ -393,6 +387,7 @@ class LinkedInJobScraper:
             )
             page = context.new_page()
             page.set_default_timeout(15000)
+
             try:
                 try:
                     self.navigate_to_page(page, company_url)
@@ -414,7 +409,7 @@ class LinkedInJobScraper:
                 total_pages = page.evaluate('''() => {
                     const pageState = document.querySelector('.jobs-search-pagination__page-state');
                     if (pageState) {
-                        const match = pageState.textContent.match(/Page \d+ of (\d+)/);
+                        const match = pageState.textContent.match(/Page \\d+ of (\\d+)/);
                         return match ? parseInt(match[1]) : 1;
                     }
                     return 1;
@@ -422,45 +417,23 @@ class LinkedInJobScraper:
                 logger.info(f"[Worker {self.worker_id}] Total pages to process: {total_pages}")
                 while page_number <= total_pages:
                     logger.info(f"[Worker {self.worker_id}] Processing page {page_number} of {total_pages}...")
-                    page_jobs = self.extract_job_cards(page)
+                    page_jobs = self.click_and_extract_job_details(page)
                     logger.info(f"[Worker {self.worker_id}] Found {len(page_jobs)} job listings on page {page_number}")
                     all_jobs.extend(page_jobs)
                     try:
-                        self.scroll_to_bottom(page)
                         if page_number < total_pages:
                             self.navigate_to_next_page(page)
+                            self.scroll_to_bottom(page)
                         page_number += 1
                     except Exception as e:
                         logger.error(f"[Worker {self.worker_id}] Error navigating to next page: {str(e)}")
                         break
-                for job in tqdm(all_jobs, desc=f"[Worker {self.worker_id}] Getting job details"):
-                    job_id = job.get('job_id')
-                    if not job_id:
-                        logger.warning(f"[Worker {self.worker_id}] Job missing job_id, skipping.")
-                        continue
-                    if job_id_exists_in_supabase(job_id):
-                        logger.info(f"[Worker {self.worker_id}] Skipping job_id {job_id} (already exists in Supabase)")
-                        continue
-                    try:
-                        job_details = self.get_job_details(page, job['linkedin_job_url'])
-                        job.update(job_details)
-                    except Exception as e:
-                        logger.error(f"[Worker {self.worker_id}] Failed to get details for job {job_id}: {str(e)}")
-                        job.update({
-                            "is_active": None,
-                            "work_arrangement": None,
-                            "contract_type": None,
-                            "seniority_level": None,
-                            "company_apply_url": "",
-                            "description": ""
-                        })
-                save_jobs_to_file(all_jobs, organization_name, dir_prefix_date)
             except Exception as e:
                 logger.error(f"[Worker {self.worker_id}] Error during scraping {company_url}: {str(e)}")
             finally:
                 context.close()
                 browser.close()
-            return all_jobs
+        return all_jobs
 
     def save_jobs_to_file(self, all_jobs: List[Dict], organization_name: str, dir_prefix_date: str):
         """Save scraped jobs to a JSON file."""
@@ -476,3 +449,86 @@ class LinkedInJobScraper:
         except Exception as e:
             logger.error(f"[Worker {self.worker_id}] Error extracting job cards: {str(e)}")
             raise e
+
+    def click_and_extract_job_details(self, page):
+        """
+        Click each job card in the current listing, extract job details from the side panel, and return a list of job dicts.
+        Does NOT navigate to job detail pages. Field names match Supabase schema.
+        """
+        import time
+        import random
+        job_cards = page.query_selector_all('div.job-card-container')
+        logger.info(f"[Worker {self.worker_id}] Found {len(job_cards)} job cards to process.")
+        if not job_cards:
+            logger.warning("No job cards found.")
+            return []
+        # Prime the side panel by clicking the first card
+        job_cards[0].click()
+        page.wait_for_selector('div.job-details-jobs-unified-top-card__job-title h1', timeout=5000)
+        time.sleep(1)
+        last_title = None
+        jobs = []
+        for i, card in enumerate(job_cards):
+            try:
+                card.click()
+                # Wait for the job title in the side panel to change
+                job_title = None
+                for _ in range(10):  # Try for up to ~5 seconds
+                    page.wait_for_timeout(0.5 * 1000)
+                    title_elem = page.query_selector('div.job-details-jobs-unified-top-card__job-title h1')
+                    job_title = title_elem.inner_text().strip() if title_elem else ""
+                    if job_title and job_title != last_title:
+                        break
+                else:
+                    logger.warning(f"Job title did not update for card {i+1}")
+                last_title = job_title
+
+                # Location
+                location_spans = page.query_selector_all('div.job-details-jobs-unified-top-card__primary-description-container span.tvm__text--low-emphasis')
+                job_location = location_spans[0].inner_text().strip() if len(location_spans) > 0 else ""
+                posted_date = location_spans[2].inner_text().strip() if len(location_spans) > 2 else ""
+
+                # Work arrangement, contract type, seniority level (new logic)
+                first_li = page.locator("li.job-details-jobs-unified-top-card__job-insight.job-details-jobs-unified-top-card__job-insight--highlight").first
+                label_spans = first_li.locator(":scope > span > span")
+                values = [label_spans.nth(i).text_content().strip() for i in range(label_spans.count())]
+                work_arrangement = values[0] if len(values) == 3 else None
+                contract_type = values[1] if len(values) == 3 else values[0] if len(values) >= 1 else None
+                seniority_level = values[2] if len(values) == 3 else values[1] if len(values) == 2 else None
+
+                # Job description
+                job_description_elem = page.query_selector('div#job-details')
+                job_description = job_description_elem.inner_text().strip() if job_description_elem else ""
+
+                # LinkedIn job URL and job ID
+                job_link_elem = card.query_selector('a.job-card-container__link')
+                linkedin_job_url = job_link_elem.get_attribute('href') if job_link_elem else ""
+                job_id = ""
+                if linkedin_job_url:
+                    import re
+                    match = re.search(r"/jobs/view/(\d+)/", linkedin_job_url)
+                    if match:
+                        job_id = match.group(1)
+
+                # Company name
+                company_name = card.query_selector('div.artdeco-entity-lockup__subtitle span').inner_text().strip() if card.query_selector('div.artdeco-entity-lockup__subtitle span') else ""
+
+                job = {
+                    'linkedinJobUrl': linkedin_job_url,
+                    'jobId': job_id,
+                    'jobTitle': job_title,
+                    'companyName': company_name,
+                    'location': job_location,
+                    'postedDate': posted_date,
+                    'workArrangement': work_arrangement,
+                    'contractType': contract_type,
+                    'seniorityLevel': seniority_level,
+                    'companyApplyUrl': '',  # Not available from side panel
+                    'description': job_description
+                }
+                jobs.append(job)
+                logger.info(f"[{i+1}/{len(job_cards)}] Title: {job_title} | Location: {job_location} | Work: {work_arrangement} | Contract: {contract_type} | Seniority: {seniority_level}")
+                time.sleep(random.uniform(1, 2.5))  # Random delay
+            except Exception as e:
+                logger.error(f"Error processing job card {i+1}: {str(e)}")
+        return jobs
