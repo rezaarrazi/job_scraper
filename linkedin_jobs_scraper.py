@@ -71,8 +71,9 @@ def handle_job_db_operations(supabase_client, jobs, organization_name, dir_prefi
     global logger
     # Fetch all existing jobIds for this company from Supabase
     try:
-        response = supabase_client.table("JobRaw").select("jobId").eq("companyName", organization_name).execute()
+        response = supabase_client.table("JobRaw").select("jobId").eq("companyId", company_id).execute()
         existing_job_ids = set(str(row["jobId"]) for row in response.data if row.get("jobId"))
+        logger.info(f"Found {len(existing_job_ids)} existing jobIds for company {organization_name}")
     except Exception as e:
         logger.error(f"Error fetching jobIds for company {organization_name} from Supabase: {str(e)}")
         existing_job_ids = set()
@@ -110,7 +111,7 @@ def handle_job_db_operations(supabase_client, jobs, organization_name, dir_prefi
                 supabase_client.table("JobRaw").update({
                     "isArchived": True,
                     "archivedDate": now_str
-                }).eq("jobId", job_id).eq("companyName", organization_name).execute()
+                }).eq("jobId", job_id).eq("companyId", company_id).execute()
                 logger.info(f"Archived jobId {job_id} for company {organization_name}")
             except Exception as e:
                 logger.error(f"Failed to archive jobId {job_id}: {str(e)}")
