@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from tqdm import tqdm
 from supabase import create_client, Client
 from dotenv import load_dotenv
+from playwright.sync_api import sync_playwright
 
 # Fieldnames for CSV writing
 fieldnames = [
@@ -20,6 +21,66 @@ fieldnames = [
 logger = setup_logger(__name__)
 
 load_dotenv()
+
+def authenticate_linkedin(username: str, password: str, save_auth_file: bool = True, auth_file: str = None):
+    """
+    Authenticate with LinkedIn and save the authentication state.
+    Returns the storage state path if successful, None otherwise.
+    """
+    
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=False)  # Set to True in production
+        context = browser.new_context()
+        page = context.new_page()
+        
+        try:
+            # Navigate to LinkedIn login page
+            page.goto('https://www.linkedin.com/login')
+            
+            # Fill in login credentials
+            page.fill('#username', username)
+            page.fill('#password', password)
+            
+            # Click the sign in button
+            page.click('button[type="submit"]')
+            
+            # Wait for navigation to complete and verify we're logged in
+            page.wait_for_url('https://www.linkedin.com/feed/', timeout=50000)
+            
+            # Save storage state
+            if save_auth_file:
+                if not auth_file:
+                    auth_file = os.path.join(os.path.dirname(__file__), '.auth', 'linkedin_auth.json')
+                # Ensure the directory exists
+                os.makedirs(os.path.dirname(auth_file), exist_ok=True)
+                context.storage_state(path=auth_file)
+                print(f"Authentication state saved to {auth_file}")
+            
+                return auth_file
+            else:
+                print("Authentication successful")
+                return None
+            
+        except Exception as e:
+            print(f"Authentication failed: {str(e)}")
+            return None
+        finally:
+            browser.close()
+
+def create_authenticated_context(playwright, auth_file: str = None):
+    """
+    Create a new browser context with saved authentication state.
+    """
+    if not auth_file:
+        auth_file = os.path.join(os.path.dirname(__file__), '.auth', 'linkedin_auth.json')
+    
+    if not os.path.exists(auth_file):
+        print("No saved authentication state found. Please run authenticate_linkedin() first.")
+        return None
+    
+    browser = playwright.chromium.launch(headless=False)  # Set to True in production
+    context = browser.new_context(storage_state=auth_file)
+    return context
 
 def create_supabase_client(supabase_url: str = None, supabase_key: str = None):
     """Create Supabase client with provided URL and key, or from environment variables if not provided."""
@@ -99,7 +160,7 @@ def extract_job_cards_js() -> str:
     Returns the JavaScript snippet for extracting job cards from a LinkedIn jobs page.
     This should be used with Playwright's page.evaluate().
     """
-    return '''
+    return r'''
         () => {
             const jobCards = document.querySelectorAll('div.job-card-container');
             const jobs = [];
@@ -156,9 +217,9 @@ class LinkedInJobScraper:
         """Initialize the scraper with credentials, worker ID, and optional Supabase client."""
         self.credentials = credentials
         self.worker_id = worker_id
-        self.auth_file = credentials.auth_file
+        self.credentials = credentials
         self.supabase = supabase_client if supabase_client is not None else create_supabase_client()
-        logger.info(f"[Worker {self.worker_id}] Using authentication file: {self.auth_file}")
+        logger.info(f"[Worker {self.worker_id}] Using authentication file: {self.credentials.auth_file}")
 
     def job_id_exists_in_supabase(self, job_id: str) -> bool:
         """
@@ -376,7 +437,7 @@ class LinkedInJobScraper:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=headless)
             context = browser.new_context(
-                storage_state=self.auth_file if os.path.exists(self.auth_file) else None
+                storage_state=self.credentials.auth_file if os.path.exists(self.credentials.auth_file) else None
             )
             page = context.new_page()
             page.set_default_timeout(15000)
@@ -387,8 +448,7 @@ class LinkedInJobScraper:
                 except Exception as e:
                     logger.warning(f"[Worker {self.worker_id}] Standard navigation failed, trying simple navigation: {str(e)}")
                     self.navigate_to_page_simple(page, company_url)
-                if self.ensure_authenticated(page):
-                    context.storage_state(path=self.auth_file)
+                
                 empty_jobs_selector = '.org-jobs-empty-jobs-module'
                 if page.locator(empty_jobs_selector).count() > 0:
                     logger.info(f"[Worker {self.worker_id}] No jobs available for this company")
@@ -422,6 +482,7 @@ class LinkedInJobScraper:
                     logger.info(f"[Worker {self.worker_id}] Processing page {page_number} of {total_pages}...")
                     # Extract all job cards (data and element handles)
                     job_card_elements = page.query_selector_all('div.job-card-container')
+                    logger.info(f"[Worker {self.worker_id}] Found {len(job_card_elements)} job cards")
                     job_card_info = []
                     for card_elem in job_card_elements:
                         # Extract jobId from the element's href attribute
