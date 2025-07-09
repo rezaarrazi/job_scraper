@@ -356,28 +356,21 @@ class LinkedInJobScraper:
             logger.error(f"[Worker {self.worker_id}] Error extracting job data from code tag: {str(e)}")
         return details
 
-    def get_existing_job_ids_for_company(self, company_name: str) -> Set[str]:
+    def get_existing_job_ids_for_company(self, company_id: str) -> Set[str]:
         """
-        Fetch all jobIds for the given company_name from Supabase JobRaw table.
+        Fetch all jobIds for the given company_id from Supabase JobRaw table.
         Returns a set of jobIds (as strings).
         """
         try:
-            response = self.supabase.table("JobRaw").select("jobId").eq("companyName", company_name).execute()
+            response = self.supabase.table("JobRaw").select("jobId").eq("companyId", company_id).execute()
             return set(str(row["jobId"]) for row in response.data if row.get("jobId"))
         except Exception as e:
-            logger.error(f"[Worker {self.worker_id}] Error fetching jobIds for company {company_name} from Supabase: {str(e)}")
+            logger.error(f"[Worker {self.worker_id}] Error fetching jobIds for companyId {company_id} from Supabase: {str(e)}")
             return set()
 
-    def scrape_company_jobs(self, company_url: str, organization_name: str, dir_prefix_date: str, headless: bool = True) -> List[Dict]:
-        """
-        Scrape all job listings from a company's LinkedIn jobs page.
-        Args:
-            company_url: URL of the company's LinkedIn jobs page
-            organization_name: Name of the organization being scraped
-        Returns:
-            List of dictionaries containing job details
-        """
-        all_jobs = []
+    def scrape_company_jobs(self, company_url: str, organization_name: str, company_id: str, dir_prefix_date: str, headless: bool = True):
+        new_jobs = []
+        reused_job_ids = []
         from playwright.sync_api import sync_playwright
         import os
         with sync_playwright() as p:
@@ -408,6 +401,10 @@ class LinkedInJobScraper:
                     return []
                 
                 self.wait_for_job_listings(page)
+
+                existing_job_ids = self.get_existing_job_ids_for_company(company_id)
+                logger.info(f"[Worker {self.worker_id}] Found {len(existing_job_ids)} existing jobIds for company {company_id}")
+                
                 results_count = self.get_results_count(page)
                 logger.info(f"[Worker {self.worker_id}] Found {results_count} job listings")
                 self.scroll_to_bottom(page)
@@ -423,9 +420,34 @@ class LinkedInJobScraper:
                 logger.info(f"[Worker {self.worker_id}] Total pages to process: {total_pages}")
                 while page_number <= total_pages:
                     logger.info(f"[Worker {self.worker_id}] Processing page {page_number} of {total_pages}...")
-                    page_jobs = self.click_and_extract_job_details(page)
-                    logger.info(f"[Worker {self.worker_id}] Found {len(page_jobs)} job listings on page {page_number}")
-                    all_jobs.extend(page_jobs)
+                    # Extract all job cards (data and element handles)
+                    job_card_elements = page.query_selector_all('div.job-card-container')
+                    job_card_info = []
+                    for card_elem in job_card_elements:
+                        # Extract jobId from the element's href attribute
+                        job_link_elem = card_elem.query_selector('a.job-card-container__link')
+                        job_id = None
+                        if job_link_elem:
+                            href = job_link_elem.get_attribute('href')
+                            if href:
+                                import re
+                                match = re.search(r"/jobs/view/(\d+)/", href)
+                                if match:
+                                    job_id = match.group(1)
+                        if not job_id:
+                            continue
+                        is_reuse = job_id in existing_job_ids
+                        if is_reuse:
+                            reused_job_ids.append(job_id)
+                        else:
+                            job_card_info.append({'jobId': job_id, 'card': card_elem})
+                    
+                    logger.info(f"[Worker {self.worker_id}] Found {len(job_card_info)} job cards to process")
+                    # Extract details for new jobs only
+                    if len(job_card_info) > 0:
+                        page_jobs = self.click_and_extract_job_details(page, job_card_info)
+                        logger.info(f"[Worker {self.worker_id}] Found {len(page_jobs)} job listings on page {page_number}")
+                        new_jobs.extend(page_jobs)
                     try:
                         if page_number < total_pages:
                             self.navigate_to_next_page(page)
@@ -434,12 +456,16 @@ class LinkedInJobScraper:
                     except Exception as e:
                         logger.error(f"[Worker {self.worker_id}] Error navigating to next page: {str(e)}")
                         break
+
+                # After processing all pages
+                all_scraped_job_ids = set(reused_job_ids) | {info['jobId'] for info in job_card_info}
+                archived_job_ids = list(set(existing_job_ids) - all_scraped_job_ids)
             except Exception as e:
                 logger.error(f"[Worker {self.worker_id}] Error during scraping {company_url}: {str(e)}")
             finally:
                 context.close()
                 browser.close()
-        return all_jobs
+        return {'reused_job_ids': reused_job_ids, 'new_jobs': new_jobs, 'archived_job_ids': archived_job_ids}
 
     def save_jobs_to_file(self, all_jobs: List[Dict], organization_name: str, dir_prefix_date: str):
         """Save scraped jobs to a JSON file."""
@@ -456,25 +482,16 @@ class LinkedInJobScraper:
             logger.error(f"[Worker {self.worker_id}] Error extracting job cards: {str(e)}")
             raise e
 
-    def click_and_extract_job_details(self, page):
+    def click_and_extract_job_details(self, page, job_card_info):
         """
         Click each job card in the current listing, extract job details from the side panel, and return a list of job dicts.
         Does NOT navigate to job detail pages. Field names match Supabase schema.
         """
         import time
         import random
-        job_cards = page.query_selector_all('div.job-card-container')
-        logger.info(f"[Worker {self.worker_id}] Found {len(job_cards)} job cards to process.")
-        if not job_cards:
-            logger.warning("No job cards found.")
-            return []
-        # Prime the side panel by clicking the first card
-        job_cards[0].click()
-        page.wait_for_selector('div.job-details-jobs-unified-top-card__job-title h1', timeout=5000)
-        time.sleep(1)
-        last_title = None
         jobs = []
-        for i, card in enumerate(job_cards):
+        for i, info in enumerate(job_card_info):
+            card = info['card']
             try:
                 card.click()
                 # Wait for the job title in the side panel to change
@@ -483,11 +500,10 @@ class LinkedInJobScraper:
                     page.wait_for_timeout(0.5 * 1000)
                     title_elem = page.query_selector('div.job-details-jobs-unified-top-card__job-title h1')
                     job_title = title_elem.inner_text().strip() if title_elem else ""
-                    if job_title and job_title != last_title:
+                    if job_title:
                         break
                 else:
                     logger.warning(f"Job title did not update for card {i+1}")
-                last_title = job_title
 
                 # Location
                 location_spans = page.query_selector_all('div.job-details-jobs-unified-top-card__primary-description-container span.tvm__text--low-emphasis')
@@ -533,7 +549,7 @@ class LinkedInJobScraper:
                     'description': job_description
                 }
                 jobs.append(job)
-                logger.info(f"[{i+1}/{len(job_cards)}] Title: {job_title} | Location: {job_location} | Work: {work_arrangement} | Contract: {contract_type} | Seniority: {seniority_level}")
+                logger.info(f"[{i+1}/{len(job_card_info)}] Title: {job_title} | Location: {job_location} | Work: {work_arrangement} | Contract: {contract_type} | Seniority: {seniority_level}")
                 time.sleep(random.uniform(1, 2.5))  # Random delay
             except Exception as e:
                 logger.error(f"Error processing job card {i+1}: {str(e)}")

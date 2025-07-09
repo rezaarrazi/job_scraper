@@ -8,8 +8,6 @@ from utils.logger import setup_logger
 import random
 import time
 import multiprocessing
-from tqdm import tqdm
-from cuid import cuid
 
 logger = setup_logger(__name__)
 
@@ -33,12 +31,18 @@ def process_companies_chunk(args):
         max_company_retries = 2
         for attempt in range(max_company_retries + 1):
             try:
-                jobs = scraper.scrape_company_jobs(linkedin_jobs_url, org_name, dir_prefix_date, headless)
-                if jobs:
-                    logger.info(f"[Worker {worker_id}] [{current}/{total}] Successfully scraped {len(jobs)} jobs from {org_name}")
-                    handle_job_db_operations(supabase_client, jobs, org_name, dir_prefix_date, company['id'])
+                result = scraper.scrape_company_jobs(linkedin_jobs_url, org_name, company['id'], dir_prefix_date, headless)
+                new_jobs = result.get('new_jobs', [])
+                archived_job_ids = result.get('archived_job_ids', [])
+                reused_job_ids = result.get('reused_job_ids', [])
+                
+                if new_jobs:
+                    logger.info(f"[Worker {worker_id}] [{current}/{total}] Successfully scraped {len(new_jobs)} new jobs from {org_name}")
+                    logger.info(f"[Worker {worker_id}] [{current}/{total}] Reused {len(reused_job_ids)} existing jobs")
+                    logger.info(f"[Worker {worker_id}] [{current}/{total}] Archived {len(archived_job_ids)} jobs")
+                    handle_job_db_operations(supabase_client, new_jobs, archived_job_ids, org_name, dir_prefix_date, company['id'])
                 else:
-                    logger.warning(f"[Worker {worker_id}] [{current}/{total}] No jobs were scraped for {org_name}")
+                    logger.warning(f"[Worker {worker_id}] [{current}/{total}] No new jobs were scraped for {org_name}")
                 
                 # Set isScrapedToday to True after processing
                 try:
@@ -59,39 +63,10 @@ def process_companies_chunk(args):
         logger.info(f"[Worker {worker_id}] Waiting {wait_time} seconds before next company...")
         time.sleep(wait_time)
 
-def handle_job_db_operations(supabase_client, jobs, organization_name, dir_prefix_date, company_id):
-    """
-    Handles filtering, inserting, and archiving jobs in Supabase for a given company.
-    - Filters out jobs that already exist in JobRaw (by jobId and companyName)
-    - Inserts new jobs (with companyId and id)
-    - Archives jobs in JobRaw for this company that are not in the new jobs
-    - Saves new jobs to file
-    """
+def handle_job_db_operations(supabase_client, new_jobs, archived_job_ids, organization_name, dir_prefix_date, company_id):
     from utils.job_scraper import save_jobs_to_file
     global logger
-    # Fetch all existing jobIds for this company from Supabase
-    try:
-        response = supabase_client.table("JobRaw").select("jobId").eq("companyId", company_id).execute()
-        existing_job_ids = set(str(row["jobId"]) for row in response.data if row.get("jobId"))
-        logger.info(f"Found {len(existing_job_ids)} existing jobIds for company {organization_name}")
-    except Exception as e:
-        logger.error(f"Error fetching jobIds for company {organization_name} from Supabase: {str(e)}")
-        existing_job_ids = set()
-    scraped_job_ids = set()
-    new_jobs = []
-    for job in jobs:
-        job_id = job.get('jobId')
-        if not job_id:
-            logger.warning(f"Job missing jobId, skipping.")
-            continue
-        if job_id in existing_job_ids:
-            logger.info(f"Skipping jobId {job_id} (already exists in Supabase)")
-            scraped_job_ids.add(job_id)
-            continue
-        scraped_job_ids.add(job_id)
-        job['companyId'] = company_id
-        job['id'] = cuid()  # Use cuid for unique id
-        new_jobs.append(job)
+
     # Insert new jobs into Supabase (batch)
     if new_jobs:
         try:
@@ -101,12 +76,12 @@ def handle_job_db_operations(supabase_client, jobs, organization_name, dir_prefi
             logger.error(f"Failed to batch insert new jobs: {str(e)}")
         # Save all jobs to file
         save_jobs_to_file(new_jobs, organization_name, dir_prefix_date)
+
     # Archive jobs that are no longer present
-    to_archive = existing_job_ids - scraped_job_ids
-    if to_archive:
+    if archived_job_ids:
         from datetime import datetime as dt
         now_str = dt.utcnow().isoformat()
-        for job_id in to_archive:
+        for job_id in archived_job_ids:
             try:
                 supabase_client.table("JobRaw").update({
                     "isArchived": True,
@@ -214,12 +189,18 @@ def main():
         linkedin_jobs_url = f"{base_url}/jobs/"
         
         try:
-            jobs = scraper.scrape_company_jobs(linkedin_jobs_url, args.organization_name, dir_prefix_date, args.headless)
-            if jobs:
-                logger.info(f"[Worker 0] Successfully scraped {len(jobs)} jobs from {args.organization_name}")
-                handle_job_db_operations(supabase_client, jobs, args.organization_name, dir_prefix_date, args.company_id)
+            result = scraper.scrape_company_jobs(linkedin_jobs_url, args.organization_name, args.company_id, dir_prefix_date, args.headless)
+            new_jobs = result.get('new_jobs', [])
+            archived_job_ids = result.get('archived_job_ids', [])
+            reused_job_ids = result.get('reused_job_ids', [])
+            
+            if new_jobs:
+                logger.info(f"[Worker 0] Successfully scraped {len(new_jobs)} new jobs from {args.organization_name}")
+                logger.info(f"[Worker 0] Reused {len(reused_job_ids)} existing jobs")
+                logger.info(f"[Worker 0] Archived {len(archived_job_ids)} jobs")
+                handle_job_db_operations(supabase_client, new_jobs, archived_job_ids, args.organization_name, dir_prefix_date, args.company_id)
             else:
-                logger.error("[Worker 0] No jobs were scraped")
+                logger.warning(f"[Worker 0] No new jobs were scraped for {args.organization_name}")
 
             # Set isScrapedToday to True after processing
             try:
