@@ -528,6 +528,59 @@ class LinkedInJobScraper:
                 browser.close()
         return {'reused_job_ids': reused_job_ids, 'new_jobs': new_jobs, 'archived_job_ids': archived_job_ids}
 
+    def get_company_jobs_url(self, company_url: str, headless: bool = True):
+        """
+        Navigate to a company's jobs page, click 'Show all jobs', and return the final URL.
+        This method is useful for getting the direct URL to all jobs for a company.
+        
+        Args:
+            company_url: The company's main jobs page URL
+            headless: Whether to run browser in headless mode
+            
+        Returns:
+            str: The final URL after clicking 'Show all jobs', or None if failed
+        """
+        from playwright.sync_api import sync_playwright
+        import os
+        
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=headless)
+            context = browser.new_context(
+                storage_state=self.credentials.auth_file if os.path.exists(self.credentials.auth_file) else None
+            )
+            page = context.new_page()
+            page.set_default_timeout(15000)
+
+            try:
+                try:
+                    self.navigate_to_page(page, company_url)
+                except Exception as e:
+                    logger.warning(f"[Worker {self.worker_id}] Standard navigation failed, trying simple navigation: {str(e)}")
+                    self.navigate_to_page_simple(page, company_url)
+                
+                # Check if there are any jobs available
+                empty_jobs_selector = '.org-jobs-empty-jobs-module'
+                if page.locator(empty_jobs_selector).count() > 0:
+                    logger.info(f"[Worker {self.worker_id}] No jobs available for this company")
+                    return None
+                
+                # Click "Show all jobs" button
+                try:
+                    self.click_show_all_jobs(page)
+                    final_url = page.url
+                    logger.info(f"[Worker {self.worker_id}] Successfully navigated to jobs listing. Final URL: {final_url}")
+                    return final_url
+                except Exception as e:
+                    logger.error(f"[Worker {self.worker_id}] Error clicking 'Show all jobs': {str(e)}")
+                    return None
+                    
+            except Exception as e:
+                logger.error(f"[Worker {self.worker_id}] Error during navigation to {company_url}: {str(e)}")
+                return None
+            finally:
+                context.close()
+                browser.close()
+
     def save_jobs_to_file(self, all_jobs: List[Dict], organization_name: str, dir_prefix_date: str):
         """Save scraped jobs to a JSON file."""
         save_jobs_to_file(all_jobs, organization_name, dir_prefix_date)

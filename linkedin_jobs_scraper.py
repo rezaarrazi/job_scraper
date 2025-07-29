@@ -12,7 +12,7 @@ import multiprocessing
 logger = setup_logger(__name__)
 
 def process_companies_chunk(args):
-    companies_chunk, credentials, dir_prefix_date, headless, worker_id = args
+    companies_chunk, credentials, dir_prefix_date, headless, worker_id, only_linkedin_jobs_url = args
     supabase_url = os.getenv('SUPABASE_URL')
     supabase_key = os.getenv('SUPABASE_SERVICE_ROLE_KEY') or os.getenv('SUPABASE_ANON_KEY')
     supabase_client = create_supabase_client(supabase_url, supabase_key)
@@ -28,6 +28,20 @@ def process_companies_chunk(args):
         base_url = linkedin_url.rstrip('/')
         linkedin_jobs_url = f"{base_url}/jobs/"
         logger.info(f"[Worker {worker_id}] [{current}/{total}] Processing {org_name} - {linkedin_jobs_url}")
+        if only_linkedin_jobs_url:
+            try:
+                jobs_url = scraper.get_company_jobs_url(linkedin_jobs_url, headless)
+                if jobs_url:
+                    try:
+                        supabase_client.table("Company").update({"linkedinJobsUrl": jobs_url}).eq("id", company['id']).execute()
+                        logger.info(f"[Worker {worker_id}] [{current}/{total}] Updated linkedinJobsUrl for {org_name} to {jobs_url}")
+                    except Exception as e:
+                        logger.error(f"[Worker {worker_id}] [{current}/{total}] Failed to update linkedinJobsUrl for {org_name}: {str(e)}")
+                else:
+                    logger.warning(f"[Worker {worker_id}] [{current}/{total}] Could not get jobs URL for {org_name}")
+            except Exception as e:
+                logger.error(f"[Worker {worker_id}] [{current}/{total}] Error getting jobs URL for {org_name}: {str(e)}")
+            continue  # Skip the rest of the flow for this company
         max_company_retries = 2
         for attempt in range(max_company_retries + 1):
             try:
@@ -103,6 +117,7 @@ def main():
     parser.add_argument('--headless', action='store_true', help='Run in headless mode')
     parser.add_argument('--num-workers', type=int, default=1, help='Number of parallel workers to use (default: 1)')
     parser.add_argument('--accounts-file', help='Path to JSON file containing LinkedIn account credentials')
+    parser.add_argument('--only-linkedin-jobs-url', action='store_true', help='Only get and store the LinkedIn jobs URL for each company')
     args = parser.parse_args()
     dir_prefix_date = datetime.now().strftime('%Y%m%d_%H%M%S')
     supabase_url = os.getenv('SUPABASE_URL')
@@ -163,7 +178,7 @@ def main():
                 for i in range(0, len(companies_list), chunk_size)
             ]
             worker_args = [
-                (chunk, credentials_list[i % len(credentials_list)], dir_prefix_date, args.headless, i)
+                (chunk, credentials_list[i % len(credentials_list)], dir_prefix_date, args.headless, i, args.only_linkedin_jobs_url)
                 for i, chunk in enumerate(company_chunks)
             ]
             with multiprocessing.Pool(num_workers) as pool:
@@ -188,6 +203,17 @@ def main():
         base_url = args.linkedin_url.rstrip('/')
         linkedin_jobs_url = f"{base_url}/jobs/"
         
+        if args.only_linkedin_jobs_url:
+            jobs_url = scraper.get_company_jobs_url(linkedin_jobs_url, args.headless)
+            if jobs_url:
+                try:
+                    supabase_client.table("Company").update({"linkedinJobsUrl": jobs_url}).eq("id", args.company_id).execute()
+                    logger.info(f"Updated linkedinJobsUrl for {args.organization_name} to {jobs_url}")
+                except Exception as e:
+                    logger.error(f"Failed to update linkedinJobsUrl for {args.organization_name}: {str(e)}")
+            else:
+                logger.warning(f"Could not get jobs URL for {args.organization_name}")
+            return
         try:
             result = scraper.scrape_company_jobs(linkedin_jobs_url, args.organization_name, args.company_id, dir_prefix_date, args.headless)
             new_jobs = result.get('new_jobs', [])
